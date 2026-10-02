@@ -2,13 +2,18 @@
 #include "ui_mainwindow.h"
 
 #include <QJsonDocument>
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QDir>
+#include <QFile>
 #include <QFileInfo>
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QProcess>
+#include <QRegularExpression>
+#include <QSaveFile>
+#include <QStandardPaths>
 #include <QUrl>
 
 MainWindow::MainWindow(QWidget *parent)
@@ -21,6 +26,10 @@ MainWindow::MainWindow(QWidget *parent)
             this, &MainWindow::startChromeForCdp);
     connect(ui->korailAutoLoginButton, &QPushButton::clicked,
             this, &MainWindow::startKorailAutoLogin);
+    connect(ui->pageRecordingButton, &QPushButton::clicked,
+            this, &MainWindow::togglePageRecording);
+
+    ui->snapshotDirectoryEdit->setText(defaultSnapshotDirectory());
 
     m_cdpReadyTimer.setInterval(200);
     connect(&m_cdpReadyTimer, &QTimer::timeout,
@@ -31,6 +40,12 @@ MainWindow::MainWindow(QWidget *parent)
             this, &MainWindow::onCdpTextMessageReceived);
     connect(&m_cdpSocket, &QWebSocket::disconnected,
             this, &MainWindow::onCdpSocketDisconnected);
+    connect(&m_recorderSocket, &QWebSocket::connected,
+            this, &MainWindow::onRecorderSocketConnected);
+    connect(&m_recorderSocket, &QWebSocket::textMessageReceived,
+            this, &MainWindow::onRecorderTextMessageReceived);
+    connect(&m_recorderSocket, &QWebSocket::disconnected,
+            this, &MainWindow::onRecorderSocketDisconnected);
 
 }
 
@@ -402,6 +417,626 @@ void MainWindow::finishKorailLogin(const QString &message, bool isError)
     }
     setBusy(false);
     showStatus(message, isError);
+}
+
+void MainWindow::togglePageRecording()
+{
+    if (m_pageRecordingRequested || m_pageRecordingActive) {
+        stopPageRecording(tr("방문 페이지 기록을 중지했습니다."));
+        return;
+    }
+
+    startPageRecording();
+}
+
+void MainWindow::startPageRecording()
+{
+    const QString snapshotDirectory = ui->snapshotDirectoryEdit->text().trimmed();
+    QString errorMessage;
+    const QUrl versionUrl = debuggerVersionUrl(&errorMessage);
+
+    if (snapshotDirectory.isEmpty()) {
+        showStatus(tr("스냅샷 저장 폴더를 입력하세요."), true);
+        return;
+    }
+    if (!versionUrl.isValid()) {
+        showStatus(errorMessage, true);
+        return;
+    }
+    if (!isLocalCdpHost(versionUrl.host())) {
+        showStatus(tr("방문 페이지 기록은 로컬 CDP 주소에서만 지원합니다."), true);
+        return;
+    }
+    if (!QDir().mkpath(snapshotDirectory)) {
+        showStatus(tr("스냅샷 저장 폴더를 만들 수 없습니다."), true);
+        return;
+    }
+
+    m_pageRecordingRequested = true;
+    ui->pageRecordingButton->setEnabled(false);
+    showStatus(tr("방문 페이지 기록용 CDP 연결을 준비하는 중입니다..."));
+
+    QNetworkReply *reply = m_networkManager.get(QNetworkRequest(versionUrl));
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        const QByteArray body = reply->readAll();
+        const bool requestSucceeded = reply->error() == QNetworkReply::NoError;
+        reply->deleteLater();
+
+        const QJsonDocument document = QJsonDocument::fromJson(body);
+        const QUrl webSocketUrl(document.object()
+                                    .value(QStringLiteral("webSocketDebuggerUrl"))
+                                    .toString());
+        if (!m_pageRecordingRequested) {
+            return;
+        }
+        if (!requestSucceeded || !webSocketUrl.isValid()
+            || (webSocketUrl.scheme() != QStringLiteral("ws")
+                && webSocketUrl.scheme() != QStringLiteral("wss"))) {
+            m_pageRecordingRequested = false;
+            ui->pageRecordingButton->setEnabled(true);
+            showStatus(tr("페이지 기록용 CDP Chrome에 연결하지 못했습니다. 먼저 CDP용 Chrome을 시작하세요."),
+                       true);
+            return;
+        }
+
+        m_recorderSocket.open(webSocketUrl);
+    });
+}
+
+void MainWindow::stopPageRecording(const QString &message)
+{
+    const bool wasRecording = m_pageRecordingRequested || m_pageRecordingActive;
+    m_pageRecordingRequested = false;
+    m_pageRecordingActive = false;
+    m_recorderRequests.clear();
+    m_recorderSessions.clear();
+    m_targetToRecorderSession.clear();
+    ui->pageRecordingButton->setEnabled(true);
+    ui->pageRecordingButton->setText(tr("방문 페이지 기록 시작"));
+
+    if (m_recorderSocket.state() != QAbstractSocket::UnconnectedState) {
+        m_recorderSocket.close();
+    }
+    if (wasRecording && !message.isEmpty()) {
+        showStatus(message);
+    }
+}
+
+void MainWindow::onRecorderSocketConnected()
+{
+    if (!m_pageRecordingRequested) {
+        m_recorderSocket.close();
+        return;
+    }
+
+    m_pageRecordingActive = true;
+    ui->pageRecordingButton->setEnabled(true);
+    ui->pageRecordingButton->setText(tr("방문 페이지 기록 중지"));
+
+    sendRecorderCommand(QStringLiteral("Target.setDiscoverTargets"),
+                        {{QStringLiteral("discover"), true}});
+    sendRecorderCommand(QStringLiteral("Target.setAutoAttach"),
+                        {{QStringLiteral("autoAttach"), true},
+                         {QStringLiteral("waitForDebuggerOnStart"), false},
+                         {QStringLiteral("flatten"), true},
+                         {QStringLiteral("filter"),
+                          QJsonArray {QJsonObject {{QStringLiteral("type"), QStringLiteral("page")}}}}});
+
+    const int commandId = sendRecorderCommand(QStringLiteral("Target.getTargets"));
+    if (commandId != 0) {
+        m_recorderRequests.insert(commandId, {RecorderRequestType::TargetList, {}, {}, {}});
+    }
+
+    showStatus(tr("방문 페이지 기록 중입니다. 입력값과 textarea 값은 저장하지 않습니다."));
+}
+
+void MainWindow::onRecorderTextMessageReceived(const QString &message)
+{
+    const QJsonObject response = QJsonDocument::fromJson(message.toUtf8()).object();
+    if (response.isEmpty()) {
+        return;
+    }
+
+    if (!response.contains(QStringLiteral("id"))) {
+        handleRecorderEvent(response);
+        return;
+    }
+
+    const int commandId = response.value(QStringLiteral("id")).toInt();
+    if (!m_recorderRequests.contains(commandId)) {
+        return;
+    }
+
+    const RecorderRequest request = m_recorderRequests.take(commandId);
+    const QJsonObject result = response.value(QStringLiteral("result")).toObject();
+    const bool failed = !response.value(QStringLiteral("error")).toObject().isEmpty()
+                        || !result.value(QStringLiteral("exceptionDetails")).toObject().isEmpty();
+    if (failed) {
+        if (request.type == RecorderRequestType::PageData
+            && m_recorderSessions.contains(request.sessionId)) {
+            m_recorderSessions[request.sessionId].captureInFlight = false;
+        }
+        return;
+    }
+
+    switch (request.type) {
+    case RecorderRequestType::TargetList: {
+        const QJsonArray targetInfos = result.value(QStringLiteral("targetInfos")).toArray();
+        for (const QJsonValue &value : targetInfos) {
+            const QJsonObject targetInfo = value.toObject();
+            if (targetInfo.value(QStringLiteral("type")).toString() != QStringLiteral("page")) {
+                continue;
+            }
+
+            const QString targetId = targetInfo.value(QStringLiteral("targetId")).toString();
+            if (!targetId.isEmpty() && !m_targetToRecorderSession.contains(targetId)) {
+                sendRecorderCommand(QStringLiteral("Target.attachToTarget"),
+                                    {{QStringLiteral("targetId"), targetId},
+                                     {QStringLiteral("flatten"), true}});
+            }
+        }
+        return;
+    }
+    case RecorderRequestType::PageData:
+        savePageData(request, result);
+        return;
+    case RecorderRequestType::DomSnapshot:
+        saveDomSnapshot(request, result);
+        return;
+    }
+}
+
+void MainWindow::onRecorderSocketDisconnected()
+{
+    const bool wasRecording = m_pageRecordingRequested || m_pageRecordingActive;
+    m_pageRecordingActive = false;
+    m_pageRecordingRequested = false;
+    m_recorderRequests.clear();
+    m_recorderSessions.clear();
+    m_targetToRecorderSession.clear();
+    ui->pageRecordingButton->setEnabled(true);
+    ui->pageRecordingButton->setText(tr("방문 페이지 기록 시작"));
+
+    if (wasRecording) {
+        showStatus(tr("페이지 기록용 CDP 연결이 끊어졌습니다."), true);
+    }
+}
+
+int MainWindow::sendRecorderCommand(const QString &method,
+                                    const QJsonObject &parameters,
+                                    const QString &sessionId)
+{
+    if (m_recorderSocket.state() != QAbstractSocket::ConnectedState) {
+        return 0;
+    }
+
+    const int commandId = m_nextRecorderCommandId++;
+    QJsonObject command {
+        {QStringLiteral("id"), commandId},
+        {QStringLiteral("method"), method}
+    };
+    if (!parameters.isEmpty()) {
+        command.insert(QStringLiteral("params"), parameters);
+    }
+    if (!sessionId.isEmpty()) {
+        command.insert(QStringLiteral("sessionId"), sessionId);
+    }
+
+    m_recorderSocket.sendTextMessage(
+        QString::fromUtf8(QJsonDocument(command).toJson(QJsonDocument::Compact)));
+    return commandId;
+}
+
+void MainWindow::handleRecorderEvent(const QJsonObject &event)
+{
+    if (!m_pageRecordingActive) {
+        return;
+    }
+
+    const QString method = event.value(QStringLiteral("method")).toString();
+    const QJsonObject parameters = event.value(QStringLiteral("params")).toObject();
+    if (method == QStringLiteral("Target.attachedToTarget")) {
+        attachRecorderToPage(parameters);
+        return;
+    }
+    if (method == QStringLiteral("Target.detachedFromTarget")) {
+        const QString sessionId = parameters.value(QStringLiteral("sessionId")).toString();
+        if (m_recorderSessions.contains(sessionId)) {
+            m_targetToRecorderSession.remove(m_recorderSessions.value(sessionId).targetId);
+            m_recorderSessions.remove(sessionId);
+        }
+        return;
+    }
+    if (method == QStringLiteral("Target.targetInfoChanged")) {
+        const QJsonObject targetInfo = parameters.value(QStringLiteral("targetInfo")).toObject();
+        const QString targetId = targetInfo.value(QStringLiteral("targetId")).toString();
+        const QString sessionId = m_targetToRecorderSession.value(targetId);
+        if (!sessionId.isEmpty() && m_recorderSessions.contains(sessionId)) {
+            RecorderSession &session = m_recorderSessions[sessionId];
+            session.url = targetInfo.value(QStringLiteral("url")).toString();
+            session.title = targetInfo.value(QStringLiteral("title")).toString();
+        }
+        return;
+    }
+    if (method == QStringLiteral("Page.loadEventFired")
+        || method == QStringLiteral("Page.navigatedWithinDocument")) {
+        schedulePageSnapshot(event.value(QStringLiteral("sessionId")).toString());
+    }
+}
+
+void MainWindow::attachRecorderToPage(const QJsonObject &parameters)
+{
+    const QJsonObject targetInfo = parameters.value(QStringLiteral("targetInfo")).toObject();
+    if (targetInfo.value(QStringLiteral("type")).toString() != QStringLiteral("page")) {
+        return;
+    }
+
+    const QString sessionId = parameters.value(QStringLiteral("sessionId")).toString();
+    const QString targetId = targetInfo.value(QStringLiteral("targetId")).toString();
+    if (sessionId.isEmpty() || targetId.isEmpty()) {
+        return;
+    }
+    if (m_targetToRecorderSession.contains(targetId)) {
+        sendRecorderCommand(QStringLiteral("Target.detachFromTarget"),
+                            {{QStringLiteral("sessionId"), sessionId}});
+        return;
+    }
+
+    m_recorderSessions.insert(sessionId,
+                              {targetId,
+                               targetInfo.value(QStringLiteral("url")).toString(),
+                               targetInfo.value(QStringLiteral("title")).toString(),
+                               false,
+                               false,
+                               {}});
+    m_targetToRecorderSession.insert(targetId, sessionId);
+
+    sendRecorderCommand(QStringLiteral("Page.enable"), {}, sessionId);
+    schedulePageSnapshot(sessionId, 800);
+}
+
+void MainWindow::schedulePageSnapshot(const QString &sessionId, int delayMilliseconds)
+{
+    if (!m_pageRecordingActive || !m_recorderSessions.contains(sessionId)) {
+        return;
+    }
+
+    RecorderSession &session = m_recorderSessions[sessionId];
+    if (session.captureScheduled || session.captureInFlight) {
+        return;
+    }
+    if (!isRecordablePageUrl(session.url)) {
+        return;
+    }
+
+    session.captureScheduled = true;
+    QTimer::singleShot(delayMilliseconds, this, [this, sessionId]() {
+        if (!m_pageRecordingActive || !m_recorderSessions.contains(sessionId)) {
+            return;
+        }
+
+        m_recorderSessions[sessionId].captureScheduled = false;
+        capturePageSnapshot(sessionId);
+    });
+}
+
+void MainWindow::capturePageSnapshot(const QString &sessionId)
+{
+    if (!m_pageRecordingActive || !m_recorderSessions.contains(sessionId)) {
+        return;
+    }
+
+    RecorderSession &session = m_recorderSessions[sessionId];
+    if (session.captureInFlight) {
+        return;
+    }
+
+    const QString snapshotDirectory = ui->snapshotDirectoryEdit->text().trimmed();
+    const QString captureId = QDateTime::currentDateTimeUtc().toString(QStringLiteral("yyyyMMddTHHmmsszzzZ"))
+                              + QStringLiteral("-%1").arg(m_nextSnapshotSequence++);
+    const QString captureDirectory = QDir(snapshotDirectory).filePath(captureId);
+    if (!QDir().mkpath(captureDirectory)) {
+        showStatus(tr("페이지 스냅샷 폴더를 만들 수 없습니다."), true);
+        return;
+    }
+
+    static const QString captureExpression = QStringLiteral(R"JS(
+(() => {
+    const redacted = '[REDACTED]';
+    const redactUrl = (rawUrl) => {
+        try {
+            const url = new URL(rawUrl);
+            for (const key of Array.from(url.searchParams.keys())) {
+                if (/(pass(word)?|secret|token|auth|session|cookie|card|cvv|ssn)/i.test(key)) {
+                    url.searchParams.set(key, redacted);
+                }
+            }
+            return url.href;
+        } catch (_) {
+            return rawUrl;
+        }
+    };
+    const isSensitive = (element) => {
+        const identity = [
+            element.getAttribute('type'),
+            element.getAttribute('name'),
+            element.getAttribute('id'),
+            element.getAttribute('autocomplete')
+        ].filter(Boolean).join(' ');
+        return /(pass(word)?|secret|token|auth|session|cookie|card|cvv|ssn)/i.test(identity);
+    };
+    const cssEscape = window.CSS && CSS.escape
+        ? CSS.escape
+        : (value) => String(value).replace(/[^a-zA-Z0-9_-]/g, '\\$&');
+    const selectorFor = (element) => {
+        if (element.id) {
+            const candidate = `#${cssEscape(element.id)}`;
+            if (document.querySelectorAll(candidate).length === 1) {
+                return candidate;
+            }
+        }
+        for (const attribute of ['data-testid', 'data-test', 'data-qa', 'name', 'aria-label']) {
+            const value = element.getAttribute(attribute);
+            if (!value) {
+                continue;
+            }
+            const candidate = `${element.tagName.toLowerCase()}[${attribute}="${cssEscape(value)}"]`;
+            if (document.querySelectorAll(candidate).length === 1) {
+                return candidate;
+            }
+        }
+        const parts = [];
+        let current = element;
+        while (current && current.nodeType === Node.ELEMENT_NODE && parts.length < 8) {
+            let index = 1;
+            let sibling = current.previousElementSibling;
+            while (sibling) {
+                if (sibling.tagName === current.tagName) {
+                    ++index;
+                }
+                sibling = sibling.previousElementSibling;
+            }
+            parts.unshift(`${current.tagName.toLowerCase()}:nth-of-type(${index})`);
+            current = current.parentElement;
+        }
+        return parts.join(' > ');
+    };
+    const rootClone = document.documentElement.cloneNode(true);
+    const originals = document.querySelectorAll('input, textarea, select');
+    const clones = rootClone.querySelectorAll('input, textarea, select');
+    originals.forEach((element, index) => {
+        const clone = clones[index];
+        if (!clone) {
+            return;
+        }
+        clone.removeAttribute('value');
+        if (clone.tagName === 'TEXTAREA') {
+            clone.textContent = '';
+        }
+        if (isSensitive(element)) {
+            clone.setAttribute('data-cdp-value-redacted', 'true');
+        }
+    });
+    const actionableElements = Array.from(document.querySelectorAll(
+        'a, button, input, textarea, select, [role="button"], [role="link"], [contenteditable="true"]'
+    )).slice(0, 5000).map((element) => {
+        const rect = element.getBoundingClientRect();
+        const input = element instanceof HTMLInputElement ? element : null;
+        return {
+            selector: selectorFor(element),
+            tag: element.tagName.toLowerCase(),
+            id: element.id || '',
+            name: element.getAttribute('name') || '',
+            type: input ? input.type : '',
+            role: element.getAttribute('role') || '',
+            text: isSensitive(element) ? '' : (element.innerText || element.textContent || '').trim().slice(0, 500),
+            ariaLabel: element.getAttribute('aria-label') || '',
+            placeholder: element.getAttribute('placeholder') || '',
+            title: element.getAttribute('title') || '',
+            href: element instanceof HTMLAnchorElement ? redactUrl(element.href) : '',
+            checked: input ? input.checked : false,
+            visible: Boolean(rect.width || rect.height),
+            rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
+        };
+    });
+    return {
+        capturedAt: new Date().toISOString(),
+        url: redactUrl(location.href),
+        title: document.title,
+        readyState: document.readyState,
+        viewport: { width: window.innerWidth, height: window.innerHeight, devicePixelRatio: window.devicePixelRatio },
+        documentHtml: '<!DOCTYPE html>\n' + rootClone.outerHTML,
+        actionableElements
+    };
+})()
+)JS");
+
+    session.captureInFlight = true;
+    const int pageCommandId = sendRecorderCommand(QStringLiteral("Runtime.evaluate"),
+                                                  {{QStringLiteral("expression"), captureExpression},
+                                                   {QStringLiteral("returnByValue"), true},
+                                                   {QStringLiteral("awaitPromise"), true}},
+                                                  sessionId);
+    if (pageCommandId == 0) {
+        session.captureInFlight = false;
+        return;
+    }
+    m_recorderRequests.insert(pageCommandId,
+                              {RecorderRequestType::PageData, captureId, captureDirectory, sessionId});
+
+    const int domCommandId = sendRecorderCommand(QStringLiteral("DOMSnapshot.captureSnapshot"),
+                                                 {{QStringLiteral("computedStyles"), QJsonArray {}},
+                                                  {QStringLiteral("includeDOMRects"), true}},
+                                                 sessionId);
+    if (domCommandId != 0) {
+        m_recorderRequests.insert(domCommandId,
+                                  {RecorderRequestType::DomSnapshot, captureId, captureDirectory, sessionId});
+    }
+}
+
+void MainWindow::savePageData(const RecorderRequest &request, const QJsonObject &result)
+{
+    if (m_recorderSessions.contains(request.sessionId)) {
+        m_recorderSessions[request.sessionId].captureInFlight = false;
+    }
+
+    const QJsonObject page = result.value(QStringLiteral("result"))
+                                 .toObject()
+                                 .value(QStringLiteral("value"))
+                                 .toObject();
+    if (page.isEmpty()) {
+        return;
+    }
+
+    const QJsonObject document {
+        {QStringLiteral("schemaVersion"), 1},
+        {QStringLiteral("captureId"), request.captureId},
+        {QStringLiteral("page"), page}
+    };
+    const QString pageFilePath = QDir(request.captureDirectory).filePath(QStringLiteral("page.json"));
+    if (!writeJsonFile(pageFilePath, document)) {
+        showStatus(tr("페이지 HTML 스냅샷을 저장하지 못했습니다."), true);
+        return;
+    }
+
+    if (m_recorderSessions.contains(request.sessionId)) {
+        RecorderSession &session = m_recorderSessions[request.sessionId];
+        session.lastCapturedUrl = page.value(QStringLiteral("url")).toString();
+        session.url = session.lastCapturedUrl;
+        session.title = page.value(QStringLiteral("title")).toString();
+    }
+
+    const QString storageDirectory = QFileInfo(request.captureDirectory).dir().absolutePath();
+    appendSnapshotManifest(storageDirectory,
+                           {{QStringLiteral("schemaVersion"), 1},
+                            {QStringLiteral("captureId"), request.captureId},
+                            {QStringLiteral("capturedAt"), page.value(QStringLiteral("capturedAt"))},
+                            {QStringLiteral("url"), page.value(QStringLiteral("url"))},
+                            {QStringLiteral("title"), page.value(QStringLiteral("title"))},
+                            {QStringLiteral("pageFile"), QDir(request.captureId).filePath(QStringLiteral("page.json"))},
+                            {QStringLiteral("domSnapshotFile"),
+                             QDir(request.captureId).filePath(QStringLiteral("dom-snapshot.json"))}});
+    showStatus(tr("페이지 정보를 저장했습니다: %1").arg(page.value(QStringLiteral("title")).toString()));
+}
+
+void MainWindow::saveDomSnapshot(const RecorderRequest &request, const QJsonObject &result)
+{
+    const QJsonObject document {
+        {QStringLiteral("schemaVersion"), 1},
+        {QStringLiteral("captureId"), request.captureId},
+        {QStringLiteral("capturedAt"), QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)},
+        {QStringLiteral("domSnapshot"), redactDomSnapshot(result)}
+    };
+    const QString filePath = QDir(request.captureDirectory).filePath(QStringLiteral("dom-snapshot.json"));
+    if (!writeJsonFile(filePath, document)) {
+        showStatus(tr("DOM 스냅샷을 저장하지 못했습니다."), true);
+    }
+}
+
+bool MainWindow::writeJsonFile(const QString &filePath, const QJsonObject &document) const
+{
+    if (!QDir().mkpath(QFileInfo(filePath).absolutePath())) {
+        return false;
+    }
+
+    QSaveFile file(filePath);
+    if (!file.open(QIODevice::WriteOnly)
+        || file.write(QJsonDocument(document).toJson(QJsonDocument::Indented)) < 0) {
+        return false;
+    }
+    return file.commit();
+}
+
+void MainWindow::appendSnapshotManifest(const QString &directory, const QJsonObject &entry) const
+{
+    QFile file(QDir(directory).filePath(QStringLiteral("manifest.jsonl")));
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
+        return;
+    }
+    file.write(QJsonDocument(entry).toJson(QJsonDocument::Compact));
+    file.write("\n");
+}
+
+QJsonObject MainWindow::redactDomSnapshot(QJsonObject snapshot)
+{
+    QJsonArray strings = snapshot.value(QStringLiteral("strings")).toArray();
+    const auto redactStringAt = [&strings](int index) {
+        if (index >= 0 && index < strings.size()) {
+            strings[index] = QStringLiteral("[REDACTED]");
+        }
+    };
+    const auto stringAt = [&strings](int index) {
+        return index >= 0 && index < strings.size() ? strings.at(index).toString() : QString();
+    };
+
+    QJsonArray documents = snapshot.value(QStringLiteral("documents")).toArray();
+    for (int documentIndex = 0; documentIndex < documents.size(); ++documentIndex) {
+        QJsonObject document = documents.at(documentIndex).toObject();
+        QJsonObject nodes = document.value(QStringLiteral("nodes")).toObject();
+
+        const auto removeInputValues = [&nodes, &redactStringAt](const QString &field) {
+            if (!nodes.contains(field)) {
+                return;
+            }
+            const QJsonArray values = nodes.value(field).toObject()
+                                          .value(QStringLiteral("value"))
+                                          .toArray();
+            for (const QJsonValue &value : values) {
+                redactStringAt(value.toInt(-1));
+            }
+            nodes.remove(field);
+        };
+        removeInputValues(QStringLiteral("inputValue"));
+        removeInputValues(QStringLiteral("textValue"));
+
+        const QJsonArray nodeNames = nodes.value(QStringLiteral("nodeName")).toArray();
+        QJsonArray attributes = nodes.value(QStringLiteral("attributes")).toArray();
+        for (int nodeIndex = 0; nodeIndex < attributes.size(); ++nodeIndex) {
+            if (nodeIndex >= nodeNames.size()) {
+                continue;
+            }
+            const int nodeNameIndex = nodeNames.at(nodeIndex).toInt(-1);
+            const QString nodeName = stringAt(nodeNameIndex).toLower();
+            if (nodeName != QStringLiteral("input")) {
+                continue;
+            }
+
+            QJsonArray attributeIndexes = attributes.at(nodeIndex).toArray();
+            for (int attributeIndex = 0;
+                 attributeIndex + 1 < attributeIndexes.size();
+                 attributeIndex += 2) {
+                const QString attributeName = stringAt(attributeIndexes.at(attributeIndex).toInt(-1))
+                                                  .toLower();
+                if (attributeName == QStringLiteral("value")) {
+                    redactStringAt(attributeIndexes.at(attributeIndex + 1).toInt(-1));
+                }
+            }
+        }
+
+        document.insert(QStringLiteral("nodes"), nodes);
+        documents[documentIndex] = document;
+    }
+
+    snapshot.insert(QStringLiteral("strings"), strings);
+    snapshot.insert(QStringLiteral("documents"), documents);
+    return snapshot;
+}
+
+QString MainWindow::defaultSnapshotDirectory()
+{
+    QString baseDirectory = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    if (baseDirectory.isEmpty()) {
+        baseDirectory = QDir::tempPath();
+    }
+    return QDir(baseDirectory).filePath(QStringLiteral("page-captures"));
+}
+
+bool MainWindow::isRecordablePageUrl(const QString &url)
+{
+    const QString scheme = QUrl(url).scheme().toLower();
+    return scheme != QStringLiteral("devtools")
+           && scheme != QStringLiteral("chrome")
+           && scheme != QStringLiteral("edge");
 }
 
 void MainWindow::setBusy(bool busy)

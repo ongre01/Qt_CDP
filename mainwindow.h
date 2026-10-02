@@ -2,8 +2,10 @@
 #define MAINWINDOW_H
 
 #include <QMainWindow>
+#include <QDateTime>
 #include <QJsonObject>
 #include <QNetworkAccessManager>
+#include <QHash>
 #include <QTimer>
 #include <QUrl>
 #include <QWebSocket>
@@ -34,6 +36,28 @@ private:
         CheckingLogin
     };
 
+    enum class RecorderRequestType {
+        TargetList,
+        PageData,
+        DomSnapshot
+    };
+
+    struct RecorderSession {
+        QString targetId;
+        QString url;
+        QString title;
+        bool captureScheduled = false;
+        bool captureInFlight = false;
+        QString lastCapturedUrl;
+    };
+
+    struct RecorderRequest {
+        RecorderRequestType type;
+        QString captureId;
+        QString captureDirectory;
+        QString sessionId;
+    };
+
     void startChromeForCdp();
     void checkStartedChromeEndpoint();
     void startKorailAutoLogin();
@@ -45,6 +69,26 @@ private:
     void submitKorailLogin();
     void checkKorailLoginResult();
     void finishKorailLogin(const QString &message, bool isError = false);
+    void togglePageRecording();
+    void startPageRecording();
+    void stopPageRecording(const QString &message = QString());
+    void onRecorderSocketConnected();
+    void onRecorderTextMessageReceived(const QString &message);
+    void onRecorderSocketDisconnected();
+    int sendRecorderCommand(const QString &method,
+                            const QJsonObject &parameters = {},
+                            const QString &sessionId = QString());
+    void handleRecorderEvent(const QJsonObject &event);
+    void attachRecorderToPage(const QJsonObject &parameters);
+    void schedulePageSnapshot(const QString &sessionId, int delayMilliseconds = 500);
+    void capturePageSnapshot(const QString &sessionId);
+    void savePageData(const RecorderRequest &request, const QJsonObject &result);
+    void saveDomSnapshot(const RecorderRequest &request, const QJsonObject &result);
+    bool writeJsonFile(const QString &filePath, const QJsonObject &document) const;
+    void appendSnapshotManifest(const QString &directory, const QJsonObject &entry) const;
+    static QJsonObject redactDomSnapshot(QJsonObject snapshot);
+    static QString defaultSnapshotDirectory();
+    static bool isRecordablePageUrl(const QString &url);
     void setBusy(bool busy);
     void showStatus(const QString &message, bool isError = false);
     QUrl debuggerVersionUrl(QString *errorMessage = nullptr) const;
@@ -53,6 +97,7 @@ private:
     Ui::MainWindow *ui;
     QNetworkAccessManager m_networkManager;
     QWebSocket m_cdpSocket;
+    QWebSocket m_recorderSocket;
     QTimer m_cdpReadyTimer;
     int m_cdpReadyAttempts = 0;
     bool m_startupRequestInFlight = false;
@@ -63,5 +108,12 @@ private:
     int m_korailResultCheckAttempts = 0;
     bool m_korailLoginInProgress = false;
     QString m_cdpSessionId;
+    bool m_pageRecordingRequested = false;
+    bool m_pageRecordingActive = false;
+    int m_nextRecorderCommandId = 1;
+    int m_nextSnapshotSequence = 1;
+    QHash<QString, RecorderSession> m_recorderSessions;
+    QHash<QString, QString> m_targetToRecorderSession;
+    QHash<int, RecorderRequest> m_recorderRequests;
 };
 #endif // MAINWINDOW_H

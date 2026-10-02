@@ -7,7 +7,7 @@
     <x>0</x>
     <y>0</y>
     <width>640</width>
-    <height>360</height>
+    <height>470</height>
    </rect>
   </property>
   <property name="windowTitle">
@@ -18,7 +18,7 @@
     <item>
      <widget class="QLabel" name="descriptionLabel">
       <property name="text">
-       <string>Qt가 별도 프로필의 Chrome을 CDP 모드로 시작하고, 디버거 엔드포인트가 준비되면 코레일 로그인을 자동화합니다. 로그인 정보는 저장하지 않습니다.</string>
+       <string>Qt가 별도 프로필의 Chrome을 CDP 모드로 시작하고, 디버거 엔드포인트가 준비되면 코레일 로그인을 자동화합니다. 로그인 정보는 저장하지 않습니다. 방문 페이지 기록은 입력값과 textarea 값을 제외한 HTML·DOM 스냅샷을 로컬에 저장합니다.</string>
       </property>
       <property name="wordWrap">
        <bool>true</bool>
@@ -66,6 +66,36 @@
         <widget class="QPushButton" name="korailAutoLoginButton">
          <property name="text">
           <string>코레일 자동 로그인</string>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+    </item>
+    <item>
+     <widget class="QGroupBox" name="pageRecordingGroupBox">
+      <property name="title">
+       <string>방문 페이지 스냅샷</string>
+      </property>
+      <layout class="QFormLayout" name="pageRecordingFormLayout">
+       <item row="0" column="0">
+        <widget class="QLabel" name="snapshotDirectoryLabel">
+         <property name="text">
+          <string>저장 폴더:</string>
+         </property>
+        </widget>
+       </item>
+       <item row="0" column="1">
+        <widget class="QLineEdit" name="snapshotDirectoryEdit">
+         <property name="placeholderText">
+          <string>페이지 스냅샷 저장 폴더</string>
+         </property>
+        </widget>
+       </item>
+       <item row="1" column="1">
+        <widget class="QPushButton" name="pageRecordingButton">
+         <property name="text">
+          <string>방문 페이지 기록 시작</string>
          </property>
         </widget>
        </item>

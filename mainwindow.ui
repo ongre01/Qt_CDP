@@ -7,7 +7,7 @@
     <x>0</x>
     <y>0</y>
     <width>640</width>
-    <height>280</height>
+    <height>360</height>
    </rect>
   </property>
   <property name="windowTitle">
@@ -18,11 +18,58 @@
     <item>
      <widget class="QLabel" name="descriptionLabel">
       <property name="text">
-       <string>Qt가 별도 프로필의 Chrome을 CDP 모드로 시작하고, 디버거 엔드포인트가 준비될 때까지 확인합니다.</string>
+       <string>Qt가 별도 프로필의 Chrome을 CDP 모드로 시작하고, 디버거 엔드포인트가 준비되면 코레일 로그인을 자동화합니다. 로그인 정보는 저장하지 않습니다.</string>
       </property>
       <property name="wordWrap">
        <bool>true</bool>
       </property>
+     </widget>
+    </item>
+    <item>
+     <widget class="QGroupBox" name="korailLoginGroupBox">
+      <property name="title">
+       <string>코레일 자동 로그인</string>
+      </property>
+      <layout class="QFormLayout" name="korailLoginFormLayout">
+       <item row="0" column="0">
+        <widget class="QLabel" name="memberNumberLabel">
+         <property name="text">
+          <string>회원번호:</string>
+         </property>
+        </widget>
+       </item>
+       <item row="0" column="1">
+        <widget class="QLineEdit" name="memberNumberEdit">
+         <property name="placeholderText">
+          <string>코레일 회원번호</string>
+         </property>
+        </widget>
+       </item>
+       <item row="1" column="0">
+        <widget class="QLabel" name="korailPasswordLabel">
+         <property name="text">
+          <string>비밀번호:</string>
+         </property>
+        </widget>
+       </item>
+       <item row="1" column="1">
+        <widget class="QLineEdit" name="korailPasswordEdit">
+         <property name="echoMode">
+          <enum>QLineEdit::Password</enum>
+         </property>
+         <property name="placeholderText">
+          <string>코레일 비밀번호</string>
+         </property>
+        </widget>
+       </item>
+       <item row="2" column="1">
+        <widget class="QPushButton" name="korailAutoLoginButton">
+         <property name="text">
+          <string>코레일 자동 로그인</string>
+         </property>
+        </widget>
+       </item>
+      </layout>
      </widget>
     </item>
     <item>

@@ -1,4 +1,4 @@
-QT += widgets
+QT += network widgets
 
 CONFIG += c++17
 

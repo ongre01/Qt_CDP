@@ -6,14 +6,106 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>800</width>
-    <height>600</height>
+    <width>640</width>
+    <height>280</height>
    </rect>
   </property>
   <property name="windowTitle">
-   <string>MainWindow</string>
+   <string>Chrome CDP 새 창</string>
   </property>
-  <widget class="QWidget" name="centralwidget"/>
+  <widget class="QWidget" name="centralwidget">
+   <layout class="QVBoxLayout" name="verticalLayout">
+    <item>
+     <widget class="QLabel" name="descriptionLabel">
+      <property name="text">
+       <string>Qt가 별도 프로필의 Chrome을 CDP 모드로 시작하고, 디버거 엔드포인트가 준비될 때까지 확인합니다.</string>
+      </property>
+      <property name="wordWrap">
+       <bool>true</bool>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <layout class="QFormLayout" name="formLayout">
+      <item row="0" column="0">
+       <widget class="QLabel" name="debuggerEndpointLabel">
+        <property name="text">
+         <string>CDP 주소:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="0" column="1">
+       <widget class="QLineEdit" name="debuggerEndpointEdit">
+        <property name="text">
+         <string>http://127.0.0.1:9222</string>
+        </property>
+        <property name="placeholderText">
+         <string>http://127.0.0.1:9222</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="0">
+       <widget class="QLabel" name="chromeExecutableLabel">
+        <property name="text">
+         <string>Chrome 실행 파일:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="1">
+       <widget class="QLineEdit" name="chromeExecutableEdit">
+        <property name="text">
+         <string>C:/Program Files/Google/Chrome/Application/chrome.exe</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="0">
+       <widget class="QLabel" name="userDataDirLabel">
+        <property name="text">
+         <string>CDP 사용자 데이터:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="1">
+       <widget class="QLineEdit" name="userDataDirEdit">
+        <property name="text">
+         <string>C:/Temp/ChromeCDP</string>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </item>
+    <item>
+     <widget class="QPushButton" name="startChromeButton">
+      <property name="text">
+       <string>CDP용 Chrome 시작</string>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <widget class="QLabel" name="statusLabel">
+      <property name="text">
+       <string>CDP용 Chrome 시작을 누르면 지정한 사용자 데이터 디렉터리로 Chrome을 별도 실행합니다.</string>
+      </property>
+      <property name="wordWrap">
+       <bool>true</bool>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <spacer name="verticalSpacer">
+      <property name="orientation">
+       <enum>Qt::Vertical</enum>
+      </property>
+      <property name="sizeHint" stdset="0">
+       <size>
+        <width>20</width>
+        <height>40</height>
+       </size>
+      </property>
+     </spacer>
+    </item>
+   </layout>
+  </widget>
   <widget class="QMenuBar" name="menubar">
    <property name="geometry">
     <rect>

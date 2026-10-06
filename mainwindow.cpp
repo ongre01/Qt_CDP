@@ -87,11 +87,9 @@ MainWindow::MainWindow(QWidget *parent)
     connect(m_authController, &KorailAuthController::statusChanged, this,
             [this](const QString &message) { showStatus(message); });
     connect(m_authController, &KorailAuthController::loginSucceeded, this, [this]() {
-        ui->korailPasswordEdit->clear();
         setBusy(false);
     });
     connect(m_authController, &KorailAuthController::loginFailed, this, [this](const QString &message) {
-        ui->korailPasswordEdit->clear();
         setBusy(false);
         showStatus(message, true);
     });

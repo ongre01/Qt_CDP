@@ -1,266 +1,33 @@
 #include "mainwindow.h"
 #include "ui_mainwindow.h"
 
-#include <QJsonDocument>
-#include <QJsonArray>
-#include <QJsonObject>
-#include <QJsonValue>
+#include "cdp/cdpclient.h"
+#include "korail/autobookingcontroller.h"
+#include "korail/korailauthcontroller.h"
+#include "korail/traininfoparser.h"
+#include "recorder/pagerecorder.h"
+#include "recorder/snapshotstorage.h"
+
 #include <QCheckBox>
 #include <QDesktopServices>
 #include <QDir>
-#include <QFile>
-#include <QFileInfo>
 #include <QHeaderView>
-#include <QNetworkReply>
-#include <QNetworkRequest>
-#include <QProcess>
-#include <QRegularExpression>
-#include <QSaveFile>
-#include <QSet>
-#include <QStandardPaths>
 #include <QTableWidgetItem>
 #include <QUrl>
-#include <QVector>
-
-namespace {
-
-QString normalizedText(const QString &text)
-{
-    QString result = text;
-    result.replace(QRegularExpression(QStringLiteral("\\s+")), QStringLiteral(" "));
-    return result.trimmed();
-}
-
-QString trainSelectionKey(const QJsonObject &train)
-{
-    return QStringList {
-        train.value(QStringLiteral("trainType")).toString(),
-        train.value(QStringLiteral("trainNumber")).toString(),
-        train.value(QStringLiteral("departure")).toString(),
-        train.value(QStringLiteral("departureTime")).toString(),
-        train.value(QStringLiteral("arrival")).toString(),
-        train.value(QStringLiteral("arrivalTime")).toString()
-    }.join(QChar(0x1f));
-}
-
-bool isReservableSeatText(const QString &seatText)
-{
-    const QString text = normalizedText(seatText);
-    const bool indicatesReservation = text.contains(QStringLiteral("예매"))
-        || text.contains(QStringLiteral("예약"));
-    const bool indicatesFare = QRegularExpression(
-        QStringLiteral("\\b\\d{1,3}(?:,\\d{3})*\\s*원"))
-                                  .match(text)
-                                  .hasMatch();
-    const bool indicatesUnavailability = text.contains(QStringLiteral("매진"))
-        || text.contains(QStringLiteral("없음"))
-        || text.contains(QStringLiteral("불가"))
-        || text.contains(QStringLiteral("대기"));
-    return (indicatesReservation || indicatesFare) && !indicatesUnavailability;
-}
-
-QJsonArray trainInfoFromDomSnapshot(const QJsonObject &snapshot, bool *isTicketReservationPage)
-{
-    if (isTicketReservationPage) {
-        *isTicketReservationPage = false;
-    }
-
-    const QJsonArray documents = snapshot.value(QStringLiteral("documents")).toArray();
-    const QJsonArray strings = snapshot.value(QStringLiteral("strings")).toArray();
-    if (documents.isEmpty() || strings.isEmpty()) {
-        return {};
-    }
-
-    const QJsonObject nodes = documents.first().toObject().value(QStringLiteral("nodes")).toObject();
-    const QJsonArray nodeNames = nodes.value(QStringLiteral("nodeName")).toArray();
-    const QJsonArray nodeValues = nodes.value(QStringLiteral("nodeValue")).toArray();
-    const QJsonArray parentIndexes = nodes.value(QStringLiteral("parentIndex")).toArray();
-    const QJsonArray attributes = nodes.value(QStringLiteral("attributes")).toArray();
-    if (nodeNames.isEmpty() || parentIndexes.size() != nodeNames.size()) {
-        return {};
-    }
-
-    const auto stringAt = [&strings](int index) {
-        return index >= 0 && index < strings.size() ? strings.at(index).toString() : QString();
-    };
-    const auto nodeName = [&nodeNames, &stringAt](int index) {
-        return stringAt(nodeNames.at(index).toInt(-1)).toLower();
-    };
-    const auto attributeValue = [&attributes, &stringAt](int nodeIndex, const QString &attributeName) {
-        if (nodeIndex < 0 || nodeIndex >= attributes.size()) {
-            return QString();
-        }
-        const QJsonArray pairs = attributes.at(nodeIndex).toArray();
-        for (int pairIndex = 0; pairIndex + 1 < pairs.size(); pairIndex += 2) {
-            if (stringAt(pairs.at(pairIndex).toInt(-1)).compare(attributeName, Qt::CaseInsensitive) == 0) {
-                return stringAt(pairs.at(pairIndex + 1).toInt(-1));
-            }
-        }
-        return QString();
-    };
-
-    QVector<QVector<int>> children(nodeNames.size());
-    for (int index = 0; index < parentIndexes.size(); ++index) {
-        const int parentIndex = parentIndexes.at(index).toInt(-1);
-        if (parentIndex >= 0 && parentIndex < children.size()) {
-            children[parentIndex].append(index);
-        }
-    }
-
-    const auto textForSubtree = [&children, &nodeName, &nodeValues, &stringAt](int root) {
-        QStringList fragments;
-        QVector<int> pending {root};
-        while (!pending.isEmpty()) {
-            const int index = pending.takeLast();
-            if (nodeName(index) == QStringLiteral("#text")) {
-                const int valueIndex = index < nodeValues.size()
-                    ? nodeValues.at(index).toInt(-1)
-                    : -1;
-                fragments.append(stringAt(valueIndex));
-            }
-            const QVector<int> &childNodes = children.at(index);
-            for (auto child = childNodes.crbegin(); child != childNodes.crend(); ++child) {
-                pending.append(*child);
-            }
-        }
-        return normalizedText(fragments.join(QLatin1Char(' ')));
-    };
-    const auto textForClassToken = [&children, &attributeValue, &textForSubtree](int root,
-                                                                                   const QString &classToken) {
-        QVector<int> pending {root};
-        while (!pending.isEmpty()) {
-            const int index = pending.takeLast();
-            const QStringList classes = attributeValue(index, QStringLiteral("class"))
-                                            .split(QRegularExpression(QStringLiteral("\\s+")),
-                                                   Qt::SkipEmptyParts);
-            if (classes.contains(classToken, Qt::CaseInsensitive)) {
-                return textForSubtree(index);
-            }
-            const QVector<int> &childNodes = children.at(index);
-            for (auto child = childNodes.crbegin(); child != childNodes.crend(); ++child) {
-                pending.append(*child);
-            }
-        }
-        return QString();
-    };
-
-    int bodyIndex = -1;
-    for (int index = 0; index < nodeNames.size(); ++index) {
-        if (nodeName(index) == QStringLiteral("body")) {
-            bodyIndex = index;
-            break;
-        }
-    }
-    const QString pageText = bodyIndex >= 0 ? textForSubtree(bodyIndex) : textForSubtree(0);
-    const bool reservationPage = QRegularExpression(
-        QStringLiteral("승차권\\s*예매|열차\\s*(조회|예매)|출발역\\s*.*도착역"))
-                                     .match(pageText)
-                                     .hasMatch();
-    if (isTicketReservationPage) {
-        *isTicketReservationPage = reservationPage;
-    }
-    if (!reservationPage) {
-        return {};
-    }
-
-    const QRegularExpression timePattern(QStringLiteral("(?:[01]?\\d|2[0-3]):[0-5]\\d"));
-    const QRegularExpression trainTypePattern(
-        QStringLiteral("KTX(?:-산천)?|SRT|ITX-?(?:새마을|마음)|새마을호|무궁화호|누리로|통근열차"),
-        QRegularExpression::CaseInsensitiveOption);
-    const QRegularExpression trainNumberPattern(QStringLiteral("(?:열차\\s*번호\\s*)?(\\d{3,5})\\s*호?"));
-    const QRegularExpression stationPairPattern(
-        QStringLiteral("([가-힣A-Za-z0-9]+)\\s*(?:역)?\\s*(?:→|->|~|-)\\s*([가-힣A-Za-z0-9]+)\\s*(?:역)?"));
-    const QRegularExpression availabilityPattern(QStringLiteral("예매|예약|좌석|매진|입석|잔여|특실|일반실"));
-    QSet<QString> seenRows;
-    QJsonArray trains;
-
-    for (int index = 0; index < nodeNames.size() && trains.size() < 200; ++index) {
-        const QString tagName = nodeName(index);
-        const bool isTrainListItem = tagName == QStringLiteral("li")
-            && attributeValue(index, QStringLiteral("class"))
-                   .contains(QStringLiteral("tckList"), Qt::CaseInsensitive);
-        if (tagName != QStringLiteral("tr") && !isTrainListItem) {
-            continue;
-        }
-
-        const QString rowText = textForSubtree(index);
-        const QString titleText = isTrainListItem
-            ? textForClassToken(index, QStringLiteral("tit_box"))
-            : rowText;
-        const QString travelText = isTrainListItem
-            ? textForClassToken(index, QStringLiteral("data_box"))
-            : rowText;
-        const QString generalSeat = isTrainListItem
-            ? textForClassToken(index, QStringLiteral("gen"))
-            : rowText;
-        const QString specialSeat = isTrainListItem
-            ? textForClassToken(index, QStringLiteral("spe"))
-            : QString();
-        QRegularExpressionMatchIterator timeMatches = timePattern.globalMatch(travelText);
-        QStringList times;
-        while (timeMatches.hasNext()) {
-            times.append(timeMatches.next().captured(0));
-        }
-        if (times.size() < 2 || !availabilityPattern.match(rowText).hasMatch()) {
-            continue;
-        }
-
-        const QRegularExpressionMatch typeMatch = trainTypePattern.match(titleText);
-        const QRegularExpressionMatch numberMatch = trainNumberPattern.match(titleText);
-        const QRegularExpressionMatch stationMatch = stationPairPattern.match(travelText);
-        const QRegularExpressionMatch durationMatch = QRegularExpression(
-            QStringLiteral("소요시간\\s*:\\s*(.+)$")).match(travelText);
-        const QString trainType = typeMatch.hasMatch() ? typeMatch.captured(0) : QString();
-        const QString trainNumber = numberMatch.hasMatch() ? numberMatch.captured(1) : QString();
-        const QString departure = stationMatch.hasMatch() ? stationMatch.captured(1) : QString();
-        const QString arrival = stationMatch.hasMatch() ? stationMatch.captured(2) : QString();
-        const QString duration = durationMatch.hasMatch() ? durationMatch.captured(1).trimmed() : QString();
-        const QString signature = QStringList {trainType, trainNumber, departure, times.at(0),
-                                               arrival, times.at(1), duration, generalSeat, specialSeat}
-                                      .join(QLatin1Char('|'));
-        if (seenRows.contains(signature)) {
-            continue;
-        }
-        seenRows.insert(signature);
-        trains.append(QJsonObject {
-            {QStringLiteral("trainType"), trainType},
-            {QStringLiteral("trainNumber"), trainNumber},
-            {QStringLiteral("departure"), departure},
-            {QStringLiteral("departureTime"), times.at(0)},
-            {QStringLiteral("arrival"), arrival},
-            {QStringLiteral("arrivalTime"), times.at(1)},
-            {QStringLiteral("duration"), duration},
-            {QStringLiteral("generalSeat"), generalSeat},
-            {QStringLiteral("specialSeat"), specialSeat}
-        });
-    }
-    return trains;
-}
-
-} // namespace
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
     , ui(new Ui::MainWindow)
+    , m_startupCdpClient(new CdpClient(this))
+    , m_authCdpClient(new CdpClient(this))
+    , m_recorderCdpClient(new CdpClient(this))
+    , m_snapshotStorage(new SnapshotStorage)
+    , m_authController(new KorailAuthController(m_authCdpClient, this))
+    , m_pageRecorder(new PageRecorder(m_recorderCdpClient, m_snapshotStorage, this))
+    , m_autoBookingController(new AutoBookingController(m_recorderCdpClient, m_pageRecorder, this))
 {
     ui->setupUi(this);
-
-    connect(ui->startChromeButton, &QPushButton::clicked,
-            this, &MainWindow::startChromeForCdp);
-    connect(ui->korailAutoLoginButton, &QPushButton::clicked,
-            this, &MainWindow::startKorailAutoLogin);
-    connect(ui->pageRecordingButton, &QPushButton::clicked,
-            this, &MainWindow::togglePageRecording);
-    connect(ui->openSnapshotDirectoryButton, &QPushButton::clicked,
-            this, &MainWindow::openSnapshotDirectory);
-    connect(ui->trainInfoTableWidget, &QTableWidget::itemChanged,
-            this, &MainWindow::onTrainInfoItemChanged);
-    connect(ui->startTrainRefreshMacroButton, &QPushButton::clicked,
-            this, &MainWindow::startTrainRefreshMacro);
-    connect(ui->stopTrainRefreshMacroButton, &QPushButton::clicked,
-            this, [this]() { stopTrainRefreshMacro(tr("열차 예매 확인 매크로를 중지했습니다.")); });
-
-    ui->snapshotDirectoryEdit->setText(defaultSnapshotDirectory());
+    ui->snapshotDirectoryEdit->setText(SnapshotStorage::defaultDirectory());
     ui->trainInfoTableWidget->setColumnCount(10);
     ui->trainInfoTableWidget->setHorizontalHeaderLabels(
         {tr("선택"), tr("열차"), tr("번호"), tr("출발역"), tr("출발 시각"),
@@ -273,134 +40,90 @@ MainWindow::MainWindow(QWidget *parent)
     ui->trainInfoGroupBox->setTitle(tr("열차 정보 (열차 조회 페이지 대기 중)"));
     ui->trainInfoGroupBox->setVisible(true);
 
-    m_cdpReadyTimer.setInterval(200);
-    connect(&m_cdpReadyTimer, &QTimer::timeout,
-            this, &MainWindow::checkStartedChromeEndpoint);
-    m_selectedTrainRefreshTimer.setSingleShot(true);
-    m_selectedTrainRefreshTimer.setInterval(
-        ui->macroRefreshIntervalSpinBox->value() * 1000);
-    connect(&m_selectedTrainRefreshTimer, &QTimer::timeout,
-            this, &MainWindow::refreshSelectedTrainPage);
-    connect(ui->macroRefreshIntervalSpinBox, &QSpinBox::valueChanged,
-            this, [this](int seconds) {
-                m_selectedTrainRefreshTimer.setInterval(seconds * 1000);
-                if (m_trainRefreshMacroActive && m_selectedTrainRefreshTimer.isActive()) {
-                    m_selectedTrainRefreshTimer.start();
-                }
-            });
-    connect(ui->autoBookWhenAvailableCheckBox, &QCheckBox::toggled,
-            this, [this](bool enabled) {
-                if (enabled) {
-                    updateSelectedTrainRefresh();
-                }
-            });
-    connect(&m_cdpSocket, &QWebSocket::connected,
-            this, &MainWindow::onCdpSocketConnected);
-    connect(&m_cdpSocket, &QWebSocket::textMessageReceived,
-            this, &MainWindow::onCdpTextMessageReceived);
-    connect(&m_cdpSocket, &QWebSocket::disconnected,
-            this, &MainWindow::onCdpSocketDisconnected);
-    connect(&m_recorderSocket, &QWebSocket::connected,
-            this, &MainWindow::onRecorderSocketConnected);
-    connect(&m_recorderSocket, &QWebSocket::textMessageReceived,
-            this, &MainWindow::onRecorderTextMessageReceived);
-    connect(&m_recorderSocket, &QWebSocket::disconnected,
-            this, &MainWindow::onRecorderSocketDisconnected);
+    connect(ui->startChromeButton, &QPushButton::clicked, this, &MainWindow::startChromeForCdp);
+    connect(ui->korailAutoLoginButton, &QPushButton::clicked, this, &MainWindow::startKorailAutoLogin);
+    connect(ui->pageRecordingButton, &QPushButton::clicked, this, &MainWindow::togglePageRecording);
+    connect(ui->openSnapshotDirectoryButton, &QPushButton::clicked, this, &MainWindow::openSnapshotDirectory);
+    connect(ui->trainInfoTableWidget, &QTableWidget::itemChanged, this, &MainWindow::onTrainInfoItemChanged);
+    connect(ui->startTrainRefreshMacroButton, &QPushButton::clicked, this, &MainWindow::startTrainRefreshMacro);
+    connect(ui->stopTrainRefreshMacroButton, &QPushButton::clicked, this, [this]() {
+        stopTrainRefreshMacro(tr("열차 예매 확인 매크로를 중지했습니다."));
+    });
+    connect(ui->macroRefreshIntervalSpinBox, &QSpinBox::valueChanged, this,
+            [this](int seconds) { m_autoBookingController->setRefreshIntervalSeconds(seconds); });
+    connect(ui->autoBookWhenAvailableCheckBox, &QCheckBox::toggled, this,
+            [this](bool enabled) { m_autoBookingController->setAutoBookWhenAvailable(enabled); });
 
+    m_autoBookingController->setRefreshIntervalSeconds(ui->macroRefreshIntervalSpinBox->value());
+    m_autoBookingController->setAutoBookWhenAvailable(ui->autoBookWhenAvailableCheckBox->isChecked());
+
+    connect(m_startupCdpClient, &CdpClient::chromeStarted, this, [this](qint64 processId) {
+        setBusy(true);
+        showStatus(tr("CDP용 Chrome(PID: %1)을 시작했습니다. 디버거 연결을 기다리는 중입니다...")
+                       .arg(processId));
+    });
+    connect(m_startupCdpClient, &CdpClient::chromeEndpointReady, this, [this](const QUrl &) {
+        setBusy(false);
+        showStatus(tr("CDP용 Chrome이 준비되었습니다. Qt에서 CDP 제어를 시작할 수 있습니다."));
+        startTrainInfoMonitoring();
+    });
+    connect(m_startupCdpClient, &CdpClient::errorOccurred, this, [this](const QString &message) {
+        setBusy(false);
+        showStatus(message, true);
+    });
+
+    connect(m_authController, &KorailAuthController::loginStarted, this, [this]() { setBusy(true); });
+    connect(m_authController, &KorailAuthController::statusChanged, this,
+            [this](const QString &message) { showStatus(message); });
+    connect(m_authController, &KorailAuthController::loginSucceeded, this, [this]() {
+        ui->korailPasswordEdit->clear();
+        setBusy(false);
+    });
+    connect(m_authController, &KorailAuthController::loginFailed, this, [this](const QString &message) {
+        ui->korailPasswordEdit->clear();
+        setBusy(false);
+        showStatus(message, true);
+    });
+
+    connect(m_pageRecorder, &PageRecorder::pageRecordingChanged, this, &MainWindow::updatePageRecordingUi);
+    connect(m_pageRecorder, &PageRecorder::snapshotCaptured, this, &MainWindow::onDomSnapshotCaptured);
+    connect(m_pageRecorder, &PageRecorder::pageDetached, this, [this](const QString &sessionId) {
+        if (sessionId == m_trainInfoSessionId) {
+            clearTrainInfoTable();
+        }
+    });
+    connect(m_pageRecorder, &PageRecorder::monitoringStopped, this, &MainWindow::clearTrainInfoTable);
+    connect(m_pageRecorder, &PageRecorder::statusChanged, this,
+            [this](const QString &message) { showStatus(message); });
+    connect(m_pageRecorder, &PageRecorder::errorOccurred, this,
+            [this](const QString &message) { showStatus(message, true); });
+
+    connect(m_autoBookingController, &AutoBookingController::runningChanged, this, [this](bool running) {
+        ui->startTrainRefreshMacroButton->setEnabled(!running);
+        ui->stopTrainRefreshMacroButton->setEnabled(running);
+    });
+    connect(m_autoBookingController, &AutoBookingController::statusChanged, this,
+            [this](const QString &message) { showStatus(message); });
+    connect(m_autoBookingController, &AutoBookingController::bookingFailed, this,
+            [this](const QString &message) { showStatus(message, true); });
 }
 
 MainWindow::~MainWindow()
 {
+    delete m_snapshotStorage;
     delete ui;
 }
 
 void MainWindow::startChromeForCdp()
 {
-    const QString chromeExecutable = ui->chromeExecutableEdit->text().trimmed();
-    const QString userDataDirectory = ui->userDataDirEdit->text().trimmed();
     QString errorMessage;
-    const QUrl versionUrl = debuggerVersionUrl(&errorMessage);
-
-    if (chromeExecutable.isEmpty() || !QFileInfo::exists(chromeExecutable)) {
-        showStatus(tr("Chrome 실행 파일을 찾을 수 없습니다."), true);
-        return;
-    }
-    if (userDataDirectory.isEmpty()) {
-        showStatus(tr("CDP 전용 사용자 데이터 디렉터리를 입력하세요."), true);
-        return;
-    }
+    const QUrl versionUrl = CdpClient::debuggerVersionUrl(ui->debuggerEndpointEdit->text(), &errorMessage);
     if (!versionUrl.isValid()) {
         showStatus(errorMessage, true);
         return;
     }
-
-    if (!isLocalCdpHost(versionUrl.host())) {
-        showStatus(tr("Chrome 시작은 로컬 CDP 주소만 지원합니다."), true);
-        return;
-    }
-
-    const QStringList arguments {
-        QStringLiteral("--remote-debugging-port=%1").arg(versionUrl.port()),
-        QStringLiteral("--user-data-dir=%1").arg(QDir::cleanPath(userDataDirectory))
-    };
-    qint64 processId = 0;
-    if (!QProcess::startDetached(chromeExecutable, arguments, QString(), &processId)) {
-        showStatus(tr("Chrome을 시작하지 못했습니다."), true);
-        return;
-    }
-
-    m_cdpReadyAttempts = 0;
-    m_startupRequestInFlight = false;
-    m_cdpReadyTimer.start();
-    setBusy(true);
-    showStatus(tr("CDP용 Chrome(PID: %1)을 시작했습니다. 디버거 연결을 기다리는 중입니다...")
-                   .arg(processId));
-}
-
-void MainWindow::checkStartedChromeEndpoint()
-{
-    if (m_startupRequestInFlight) {
-        return;
-    }
-
-    constexpr int maxAttempts = 50;
-    if (++m_cdpReadyAttempts > maxAttempts) {
-        m_cdpReadyTimer.stop();
-        setBusy(false);
-        showStatus(tr("Chrome CDP 엔드포인트가 10초 안에 준비되지 않았습니다."), true);
-        return;
-    }
-
-    QString errorMessage;
-    const QUrl versionUrl = debuggerVersionUrl(&errorMessage);
-    if (!versionUrl.isValid()) {
-        m_cdpReadyTimer.stop();
-        setBusy(false);
-        showStatus(errorMessage, true);
-        return;
-    }
-
-    m_startupRequestInFlight = true;
-    QNetworkReply *reply = m_networkManager.get(QNetworkRequest(versionUrl));
-    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
-        const QByteArray body = reply->readAll();
-        const bool requestSucceeded = reply->error() == QNetworkReply::NoError;
-        reply->deleteLater();
-        m_startupRequestInFlight = false;
-
-        const QJsonDocument document = QJsonDocument::fromJson(body);
-        const QString webSocketDebuggerUrl = document.object()
-                                                .value(QStringLiteral("webSocketDebuggerUrl"))
-                                                .toString();
-        if (!requestSucceeded || webSocketDebuggerUrl.isEmpty()) {
-            return;
-        }
-
-        m_cdpReadyTimer.stop();
-        setBusy(false);
-        showStatus(tr("CDP용 Chrome이 준비되었습니다. Qt에서 CDP 제어를 시작할 수 있습니다."));
-        startTrainInfoMonitoring();
-    });
+    m_startupCdpClient->startChrome(ui->chromeExecutableEdit->text().trimmed(),
+                                    ui->userDataDirEdit->text().trimmed(), versionUrl);
 }
 
 void MainWindow::startKorailAutoLogin()
@@ -408,8 +131,7 @@ void MainWindow::startKorailAutoLogin()
     const QString memberNumber = ui->memberNumberEdit->text().trimmed();
     const QString password = ui->korailPasswordEdit->text();
     QString errorMessage;
-    const QUrl versionUrl = debuggerVersionUrl(&errorMessage);
-
+    const QUrl versionUrl = CdpClient::debuggerVersionUrl(ui->debuggerEndpointEdit->text(), &errorMessage);
     if (memberNumber.isEmpty() || password.isEmpty()) {
         showStatus(tr("코레일 회원번호와 비밀번호를 모두 입력하세요."), true);
         return;
@@ -418,277 +140,38 @@ void MainWindow::startKorailAutoLogin()
         showStatus(errorMessage, true);
         return;
     }
-    if (!isLocalCdpHost(versionUrl.host())) {
+    if (!CdpClient::isLocalHost(versionUrl.host())) {
         showStatus(tr("자동 로그인은 로컬 CDP 주소에서만 실행할 수 있습니다."), true);
         return;
     }
-    if (m_korailLoginInProgress) {
+    if (m_authController->isLoggingIn()) {
         return;
     }
-
     startTrainInfoMonitoring();
-    m_korailLoginInProgress = true;
-    m_korailLoginStep = KorailLoginStep::Idle;
-    m_pendingCdpCommandId = 0;
-    m_korailFormCheckAttempts = 0;
-    m_korailResultCheckAttempts = 0;
-    m_cdpSessionId.clear();
-    setBusy(true);
-    showStatus(tr("코레일 로그인용 Chrome 탭에 연결하는 중입니다..."));
-
-    QNetworkReply *reply = m_networkManager.get(QNetworkRequest(versionUrl));
-    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
-        const QByteArray body = reply->readAll();
-        const bool requestSucceeded = reply->error() == QNetworkReply::NoError;
-        reply->deleteLater();
-
-        const QJsonDocument document = QJsonDocument::fromJson(body);
-        const QString webSocketDebuggerUrl = document.object()
-                                                .value(QStringLiteral("webSocketDebuggerUrl"))
-                                                .toString();
-        const QUrl webSocketUrl(webSocketDebuggerUrl);
-        if (!m_korailLoginInProgress) {
-            return;
-        }
-        if (!requestSucceeded || !webSocketUrl.isValid()
-            || (webSocketUrl.scheme() != QStringLiteral("ws")
-                && webSocketUrl.scheme() != QStringLiteral("wss"))) {
-            finishKorailLogin(tr("CDP Chrome에 연결하지 못했습니다. 먼저 CDP용 Chrome을 시작하세요."), true);
-            return;
-        }
-
-        m_cdpSocket.open(webSocketUrl);
-    });
-}
-
-void MainWindow::onCdpSocketConnected()
-{
-    if (!m_korailLoginInProgress) {
-        m_cdpSocket.close();
-        return;
-    }
-
-    m_korailLoginStep = KorailLoginStep::CreatingTarget;
-    sendCdpCommand(QStringLiteral("Target.createTarget"),
-                   {{QStringLiteral("url"), QStringLiteral("https://www.korail.com/ticket/login")}});
-}
-
-void MainWindow::onCdpTextMessageReceived(const QString &message)
-{
-    const QJsonDocument document = QJsonDocument::fromJson(message.toUtf8());
-    const QJsonObject response = document.object();
-    if (response.isEmpty() || !m_korailLoginInProgress) {
-        return;
-    }
-
-    if (!response.contains(QStringLiteral("id"))) {
-        return;
-    }
-    if (response.value(QStringLiteral("id")).toInt() != m_pendingCdpCommandId) {
-        return;
-    }
-
-    const QJsonObject error = response.value(QStringLiteral("error")).toObject();
-    if (!error.isEmpty()) {
-        finishKorailLogin(tr("Chrome CDP 명령을 실행하지 못했습니다: %1")
-                               .arg(error.value(QStringLiteral("message")).toString()),
-                           true);
-        return;
-    }
-
-    const QJsonObject result = response.value(QStringLiteral("result")).toObject();
-    if (result.contains(QStringLiteral("exceptionDetails"))) {
-        finishKorailLogin(tr("코레일 로그인 페이지에서 자동화 스크립트를 실행하지 못했습니다."), true);
-        return;
-    }
-
-    switch (m_korailLoginStep) {
-    case KorailLoginStep::CreatingTarget: {
-        const QString targetId = result.value(QStringLiteral("targetId")).toString();
-        if (targetId.isEmpty()) {
-            finishKorailLogin(tr("코레일 로그인용 Chrome 탭을 만들지 못했습니다."), true);
-            return;
-        }
-        m_korailLoginStep = KorailLoginStep::AttachingTarget;
-        sendCdpCommand(QStringLiteral("Target.attachToTarget"),
-                       {{QStringLiteral("targetId"), targetId},
-                        {QStringLiteral("flatten"), true}});
-        return;
-    }
-    case KorailLoginStep::AttachingTarget:
-        m_cdpSessionId = result.value(QStringLiteral("sessionId")).toString();
-        if (m_cdpSessionId.isEmpty()) {
-            finishKorailLogin(tr("코레일 로그인 탭에 연결하지 못했습니다."), true);
-            return;
-        }
-        m_korailLoginStep = KorailLoginStep::EnablingPage;
-        sendCdpCommand(QStringLiteral("Page.enable"));
-        return;
-    case KorailLoginStep::EnablingPage:
-        m_korailLoginStep = KorailLoginStep::Navigating;
-        sendCdpCommand(QStringLiteral("Page.navigate"),
-                       {{QStringLiteral("url"), QStringLiteral("https://www.korail.com/ticket/login")}});
-        return;
-    case KorailLoginStep::Navigating:
-        m_korailFormCheckAttempts = 0;
-        QTimer::singleShot(200, this, &MainWindow::waitForKorailLoginForm);
-        return;
-    case KorailLoginStep::WaitingForLoginForm: {
-        const QJsonValue value = result.value(QStringLiteral("result"))
-                                     .toObject()
-                                     .value(QStringLiteral("value"));
-        if (value.toBool()) {
-            submitKorailLogin();
-            return;
-        }
-        if (++m_korailFormCheckAttempts >= 50) {
-            finishKorailLogin(tr("코레일 로그인 페이지의 입력란을 찾지 못했습니다."), true);
-            return;
-        }
-        QTimer::singleShot(200, this, &MainWindow::waitForKorailLoginForm);
-        return;
-    }
-    case KorailLoginStep::SubmittingLogin:
-        m_korailResultCheckAttempts = 0;
-        QTimer::singleShot(500, this, &MainWindow::checkKorailLoginResult);
-        return;
-    case KorailLoginStep::CheckingLogin: {
-        const QJsonObject value = result.value(QStringLiteral("result"))
-                                      .toObject()
-                                      .value(QStringLiteral("value"))
-                                      .toObject();
-        const bool loggedIn = value.value(QStringLiteral("loggedIn")).toBool();
-        const bool loginFormPresent = value.value(QStringLiteral("loginFormPresent")).toBool();
-        if (loggedIn || !loginFormPresent) {
-            finishKorailLogin(tr("코레일 로그인 완료를 감지했습니다."));
-            return;
-        }
-        if (++m_korailResultCheckAttempts >= 20) {
-            finishKorailLogin(tr("로그인 완료를 확인하지 못했습니다. 열린 Chrome 탭을 확인하세요."), true);
-            return;
-        }
-        QTimer::singleShot(500, this, &MainWindow::checkKorailLoginResult);
-        return;
-    }
-    case KorailLoginStep::Idle:
-        return;
-    }
-}
-
-void MainWindow::onCdpSocketDisconnected()
-{
-    if (m_korailLoginInProgress) {
-        finishKorailLogin(tr("Chrome CDP 연결이 끊어졌습니다."), true);
-    }
-}
-
-void MainWindow::sendCdpCommand(const QString &method, const QJsonObject &parameters)
-{
-    QJsonObject command {
-        {QStringLiteral("id"), m_nextCdpCommandId++},
-        {QStringLiteral("method"), method}
-    };
-    if (!parameters.isEmpty()) {
-        command.insert(QStringLiteral("params"), parameters);
-    }
-    if (!m_cdpSessionId.isEmpty()) {
-        command.insert(QStringLiteral("sessionId"), m_cdpSessionId);
-    }
-
-    m_pendingCdpCommandId = command.value(QStringLiteral("id")).toInt();
-    m_cdpSocket.sendTextMessage(QString::fromUtf8(QJsonDocument(command).toJson(QJsonDocument::Compact)));
-}
-
-void MainWindow::waitForKorailLoginForm()
-{
-    if (!m_korailLoginInProgress || m_cdpSessionId.isEmpty()) {
-        return;
-    }
-
-    m_korailLoginStep = KorailLoginStep::WaitingForLoginForm;
-    sendCdpCommand(QStringLiteral("Runtime.evaluate"),
-                   {{QStringLiteral("expression"),
-                     QStringLiteral("Boolean(document.querySelector('#id') && document.querySelector('#password') && document.querySelector('#tab_memNum .btn_bn-depblue'))")},
-                    {QStringLiteral("returnByValue"), true}});
-}
-
-void MainWindow::submitKorailLogin()
-{
-    if (!m_korailLoginInProgress) {
-        return;
-    }
-
-    const QJsonObject credentials {
-        {QStringLiteral("memberNumber"), ui->memberNumberEdit->text().trimmed()},
-        {QStringLiteral("password"), ui->korailPasswordEdit->text()}
-    };
-    const QString expression = QStringLiteral(R"JS(
-(() => {
-    const credentials = %1;
-    const setValue = (element, value) => {
-        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-        setter.call(element, value);
-        element.dispatchEvent(new Event('input', { bubbles: true }));
-        element.dispatchEvent(new Event('change', { bubbles: true }));
-    };
-    const memberNumberInput = document.querySelector('#id');
-    const passwordInput = document.querySelector('#password');
-    const loginButton = document.querySelector('#tab_memNum .btn_bn-depblue');
-    if (!memberNumberInput || !passwordInput || !loginButton) {
-        throw new Error('Korail login controls are unavailable.');
-    }
-    setValue(memberNumberInput, credentials.memberNumber);
-    setValue(passwordInput, credentials.password);
-    loginButton.click();
-    return true;
-})()
-)JS")
-                                   .arg(QString::fromUtf8(QJsonDocument(credentials)
-                                                              .toJson(QJsonDocument::Compact)));
-
-    m_korailLoginStep = KorailLoginStep::SubmittingLogin;
-    sendCdpCommand(QStringLiteral("Runtime.evaluate"),
-                   {{QStringLiteral("expression"), expression},
-                    {QStringLiteral("awaitPromise"), true},
-                    {QStringLiteral("returnByValue"), true},
-                    {QStringLiteral("userGesture"), true}});
-}
-
-void MainWindow::checkKorailLoginResult()
-{
-    if (!m_korailLoginInProgress || m_cdpSessionId.isEmpty()) {
-        return;
-    }
-
-    m_korailLoginStep = KorailLoginStep::CheckingLogin;
-    sendCdpCommand(QStringLiteral("Runtime.evaluate"),
-                   {{QStringLiteral("expression"),
-                     QStringLiteral("(() => ({ loginFormPresent: Boolean(document.querySelector('#id') && document.querySelector('#password')), loggedIn: Array.from(document.querySelectorAll('a, button')).some((element) => (element.textContent || '').trim() === '로그아웃') }))()")},
-                    {QStringLiteral("returnByValue"), true}});
-}
-
-void MainWindow::finishKorailLogin(const QString &message, bool isError)
-{
-    m_korailLoginInProgress = false;
-    m_korailLoginStep = KorailLoginStep::Idle;
-    m_pendingCdpCommandId = 0;
-    m_cdpSessionId.clear();
-    ui->korailPasswordEdit->clear();
-    if (m_cdpSocket.state() != QAbstractSocket::UnconnectedState) {
-        m_cdpSocket.close();
-    }
-    setBusy(false);
-    showStatus(message, isError);
+    m_authController->login(memberNumber, password, versionUrl);
 }
 
 void MainWindow::togglePageRecording()
 {
-    if (m_pageRecordingRequested || m_pageRecordingActive) {
-        stopPageRecording(tr("방문 페이지 기록을 중지했습니다."));
+    if (m_pageRecorder->isPageRecordingActive()) {
+        m_pageRecorder->stopPageRecording();
+        showStatus(tr("방문 페이지 기록을 중지했습니다."));
         return;
     }
-
-    startPageRecording();
+    QString errorMessage;
+    const QUrl versionUrl = CdpClient::debuggerVersionUrl(ui->debuggerEndpointEdit->text(), &errorMessage);
+    if (!versionUrl.isValid()) {
+        showStatus(errorMessage, true);
+        return;
+    }
+    if (!CdpClient::isLocalHost(versionUrl.host())) {
+        showStatus(tr("열차 정보 수집은 로컬 CDP 주소에서만 지원합니다."), true);
+        return;
+    }
+    ui->pageRecordingButton->setEnabled(false);
+    if (!m_pageRecorder->startPageRecording(versionUrl, ui->snapshotDirectoryEdit->text().trimmed())) {
+        ui->pageRecordingButton->setEnabled(true);
+    }
 }
 
 void MainWindow::openSnapshotDirectory()
@@ -707,968 +190,77 @@ void MainWindow::openSnapshotDirectory()
     }
 }
 
-void MainWindow::startPageRecording()
-{
-    const QString snapshotDirectory = ui->snapshotDirectoryEdit->text().trimmed();
-
-    if (snapshotDirectory.isEmpty()) {
-        showStatus(tr("스냅샷 저장 폴더를 입력하세요."), true);
-        return;
-    }
-    if (!QDir().mkpath(snapshotDirectory)) {
-        showStatus(tr("스냅샷 저장 폴더를 만들 수 없습니다."), true);
-        return;
-    }
-    if (m_pageRecordingRequested || m_pageRecordingActive) {
-        return;
-    }
-
-    m_pageRecordingRequested = true;
-    ui->pageRecordingButton->setEnabled(false);
-    if (m_trainInfoMonitoringActive) {
-        m_pageRecordingActive = true;
-        ui->pageRecordingButton->setEnabled(true);
-        ui->pageRecordingButton->setText(tr("방문 페이지 기록 중지"));
-        showStatus(tr("방문 페이지 스냅샷 저장을 시작했습니다."));
-        return;
-    }
-    if (m_trainInfoMonitoringRequested) {
-        showStatus(tr("방문 페이지 기록용 CDP 연결을 준비하는 중입니다..."));
-        return;
-    }
-    if (!startRecorderConnection()) {
-        m_pageRecordingRequested = false;
-        ui->pageRecordingButton->setEnabled(true);
-    }
-}
-
 void MainWindow::startTrainInfoMonitoring()
 {
-    if (isRecorderRequested() || isRecorderActive()) {
+    if (m_pageRecorder->isMonitoringRequested() || m_pageRecorder->isMonitoringActive()) {
         return;
     }
-
-    m_trainInfoMonitoringRequested = true;
-    if (!startRecorderConnection()) {
-        m_trainInfoMonitoringRequested = false;
-    }
-}
-
-bool MainWindow::startRecorderConnection()
-{
     QString errorMessage;
-    const QUrl versionUrl = debuggerVersionUrl(&errorMessage);
+    const QUrl versionUrl = CdpClient::debuggerVersionUrl(ui->debuggerEndpointEdit->text(), &errorMessage);
     if (!versionUrl.isValid()) {
         showStatus(errorMessage, true);
-        return false;
-    }
-    if (!isLocalCdpHost(versionUrl.host())) {
-        showStatus(tr("열차 정보 수집은 로컬 CDP 주소에서만 지원합니다."), true);
-        return false;
-    }
-
-    QNetworkReply *reply = m_networkManager.get(QNetworkRequest(versionUrl));
-    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
-        const QByteArray body = reply->readAll();
-        const bool requestSucceeded = reply->error() == QNetworkReply::NoError;
-        reply->deleteLater();
-
-        const QJsonDocument document = QJsonDocument::fromJson(body);
-        const QUrl webSocketUrl(document.object()
-                                    .value(QStringLiteral("webSocketDebuggerUrl"))
-                                    .toString());
-        if (!isRecorderRequested()) {
-            return;
-        }
-        if (!requestSucceeded || !webSocketUrl.isValid()
-            || (webSocketUrl.scheme() != QStringLiteral("ws")
-                && webSocketUrl.scheme() != QStringLiteral("wss"))) {
-            m_pageRecordingRequested = false;
-            m_trainInfoMonitoringRequested = false;
-            ui->pageRecordingButton->setEnabled(true);
-            if (m_trainRefreshMacroActive) {
-                stopTrainRefreshMacro();
-            }
-            showStatus(tr("열차 정보 수집용 CDP Chrome에 연결하지 못했습니다. 먼저 CDP용 Chrome을 시작하세요."),
-                       true);
-            return;
-        }
-
-        m_recorderSocket.open(webSocketUrl);
-    });
-    return true;
-}
-
-bool MainWindow::isRecorderRequested() const
-{
-    return m_pageRecordingRequested || m_trainInfoMonitoringRequested;
-}
-
-bool MainWindow::isRecorderActive() const
-{
-    return m_pageRecordingActive || m_trainInfoMonitoringActive;
-}
-
-void MainWindow::stopPageRecording(const QString &message)
-{
-    const bool wasRecording = m_pageRecordingRequested || m_pageRecordingActive;
-    m_pageRecordingRequested = false;
-    m_pageRecordingActive = false;
-    ui->pageRecordingButton->setEnabled(true);
-    ui->pageRecordingButton->setText(tr("방문 페이지 기록 시작"));
-
-    if (m_trainInfoMonitoringRequested || m_trainInfoMonitoringActive) {
-        if (wasRecording && !message.isEmpty()) {
-            showStatus(message);
-        }
         return;
     }
-
-    m_recorderRequests.clear();
-    m_recorderSessions.clear();
-    m_targetToRecorderSession.clear();
-    clearTrainInfoTable();
-
-    if (m_recorderSocket.state() != QAbstractSocket::UnconnectedState) {
-        m_recorderSocket.close();
+    if (!CdpClient::isLocalHost(versionUrl.host())) {
+        showStatus(tr("열차 정보 수집은 로컬 CDP 주소에서만 지원합니다."), true);
+        return;
     }
-    if (wasRecording && !message.isEmpty()) {
+    m_pageRecorder->startMonitoring(versionUrl);
+}
+
+void MainWindow::startTrainRefreshMacro()
+{
+    startTrainInfoMonitoring();
+    m_autoBookingController->start();
+}
+
+void MainWindow::stopTrainRefreshMacro(const QString &message)
+{
+    const bool wasRunning = m_autoBookingController->isRunning();
+    m_autoBookingController->stop();
+    if (wasRunning && !message.isEmpty()) {
         showStatus(message);
     }
 }
 
-void MainWindow::onRecorderSocketConnected()
+void MainWindow::onDomSnapshotCaptured(const QJsonObject &snapshot, const QString &sessionId)
 {
-    if (!isRecorderRequested()) {
-        m_recorderSocket.close();
-        return;
-    }
-
-    if (m_pageRecordingRequested) {
-        m_pageRecordingActive = true;
-        ui->pageRecordingButton->setEnabled(true);
-        ui->pageRecordingButton->setText(tr("방문 페이지 기록 중지"));
-    }
-    if (m_trainInfoMonitoringRequested) {
-        m_trainInfoMonitoringActive = true;
-    }
-
-    sendRecorderCommand(QStringLiteral("Target.setDiscoverTargets"),
-                        {{QStringLiteral("discover"), true}});
-    sendRecorderCommand(QStringLiteral("Target.setAutoAttach"),
-                        {{QStringLiteral("autoAttach"), true},
-                         {QStringLiteral("waitForDebuggerOnStart"), false},
-                         {QStringLiteral("flatten"), true},
-                         {QStringLiteral("filter"),
-                          QJsonArray {QJsonObject {{QStringLiteral("type"), QStringLiteral("page")}}}}});
-
-    const int commandId = sendRecorderCommand(QStringLiteral("Target.getTargets"));
-    if (commandId != 0) {
-        m_recorderRequests.insert(commandId, {RecorderRequestType::TargetList, {}, {}, {}, false});
-    }
-
-    showStatus(m_pageRecordingActive
-                   ? tr("방문 페이지 기록 중입니다. 입력값과 textarea 값은 저장하지 않습니다.")
-                   : tr("열차 정보 수집 중입니다. 열차 조회 페이지를 열면 목록을 표시합니다."));
-}
-
-void MainWindow::onRecorderTextMessageReceived(const QString &message)
-{
-    const QJsonObject response = QJsonDocument::fromJson(message.toUtf8()).object();
-    if (response.isEmpty()) {
-        return;
-    }
-
-    if (!response.contains(QStringLiteral("id"))) {
-        handleRecorderEvent(response);
-        return;
-    }
-
-    const int commandId = response.value(QStringLiteral("id")).toInt();
-    if (!m_recorderRequests.contains(commandId)) {
-        return;
-    }
-
-    const RecorderRequest request = m_recorderRequests.take(commandId);
-    const QJsonObject result = response.value(QStringLiteral("result")).toObject();
-    const bool failed = !response.value(QStringLiteral("error")).toObject().isEmpty()
-                        || !result.value(QStringLiteral("exceptionDetails")).toObject().isEmpty();
-    if (failed) {
-        if (request.type == RecorderRequestType::DomSnapshot
-            && m_recorderSessions.contains(request.sessionId)) {
-            m_recorderSessions[request.sessionId].captureInFlight = false;
-        }
-        const bool isAutoBookingRequest = request.type == RecorderRequestType::AutoBooking
-                                          || request.type == RecorderRequestType::AutoBookingMousePressed
-                                          || request.type == RecorderRequestType::AutoBookingMouseReleased
-                                          || request.type == RecorderRequestType::AutoBookingConfirm
-                                          || request.type == RecorderRequestType::AutoBookingConfirmMousePressed
-                                          || request.type == RecorderRequestType::AutoBookingConfirmMouseReleased
-                                          || request.type == RecorderRequestType::AutoBookingDismissDialog
-                                          || request.type == RecorderRequestType::AutoBookingDismissDialogMousePressed
-                                          || request.type == RecorderRequestType::AutoBookingDismissDialogMouseReleased;
-        if (isAutoBookingRequest) {
-            m_autoBookingInProgress = false;
-            m_autoBookingSeatType.clear();
-            m_autoBookingClickX = 0.0;
-            m_autoBookingClickY = 0.0;
-            m_autoBookingConfirmationAttempts = 0;
-            m_autoBookingDialogAttempts = 0;
-            m_autoBookingDialogClicks = 0;
-            m_autoBookingDialogDomFallbackUsed = false;
-            m_autoBookingWaitingForSelectionNotice = false;
-            stopTrainRefreshMacro();
-            showStatus(tr("자동 예매 명령을 실행하지 못했습니다."), true);
-        }
-        return;
-    }
-
-    switch (request.type) {
-    case RecorderRequestType::TargetList: {
-        const QJsonArray targetInfos = result.value(QStringLiteral("targetInfos")).toArray();
-        for (const QJsonValue &value : targetInfos) {
-            const QJsonObject targetInfo = value.toObject();
-            if (targetInfo.value(QStringLiteral("type")).toString() != QStringLiteral("page")) {
-                continue;
-            }
-
-            const QString targetId = targetInfo.value(QStringLiteral("targetId")).toString();
-            if (!targetId.isEmpty() && !m_targetToRecorderSession.contains(targetId)) {
-                sendRecorderCommand(QStringLiteral("Target.attachToTarget"),
-                                    {{QStringLiteral("targetId"), targetId},
-                                     {QStringLiteral("flatten"), true}});
-            }
-        }
-        return;
-    }
-    case RecorderRequestType::DomSnapshot:
-        saveDomSnapshot(request, result);
-        return;
-    case RecorderRequestType::AutoBooking: {
-        const QJsonObject value = result.value(QStringLiteral("result"))
-                                      .toObject()
-                                      .value(QStringLiteral("value"))
-                                      .toObject();
-        if (!value.value(QStringLiteral("found")).toBool()
-            || !value.value(QStringLiteral("x")).isDouble()
-            || !value.value(QStringLiteral("y")).isDouble()) {
-            m_autoBookingInProgress = false;
-            m_autoBookingClickX = 0.0;
-            m_autoBookingClickY = 0.0;
-            stopTrainRefreshMacro();
-            showStatus(tr("자동 예매를 시작하지 못했습니다: %1")
-                           .arg(value.value(QStringLiteral("message"))
-                                    .toString(tr("예매 버튼을 찾지 못했습니다."))),
-                       true);
-            return;
-        }
-
-        m_autoBookingSeatType = value.value(QStringLiteral("seatType"))
-                                   .toString(tr("선택한 좌석"));
-        m_autoBookingClickX = value.value(QStringLiteral("x")).toDouble();
-        m_autoBookingClickY = value.value(QStringLiteral("y")).toDouble();
-        const int commandId = sendRecorderCommand(
-            QStringLiteral("Input.dispatchMouseEvent"),
-            {{QStringLiteral("type"), QStringLiteral("mousePressed")},
-             {QStringLiteral("x"), m_autoBookingClickX},
-             {QStringLiteral("y"), m_autoBookingClickY},
-             {QStringLiteral("button"), QStringLiteral("left")},
-             {QStringLiteral("clickCount"), 1}},
-            request.sessionId);
-        if (commandId == 0) {
-            m_autoBookingInProgress = false;
-            m_autoBookingSeatType.clear();
-            m_autoBookingClickX = 0.0;
-            m_autoBookingClickY = 0.0;
-            stopTrainRefreshMacro();
-            showStatus(tr("자동 예매 버튼에 마우스 입력을 보낼 수 없습니다."), true);
-            return;
-        }
-        m_recorderRequests.insert(commandId,
-                                  {RecorderRequestType::AutoBookingMousePressed,
-                                   {}, {}, request.sessionId, false});
-        return;
-    }
-    case RecorderRequestType::AutoBookingMousePressed: {
-        const int commandId = sendRecorderCommand(
-            QStringLiteral("Input.dispatchMouseEvent"),
-            {{QStringLiteral("type"), QStringLiteral("mouseReleased")},
-             {QStringLiteral("x"), m_autoBookingClickX},
-             {QStringLiteral("y"), m_autoBookingClickY},
-             {QStringLiteral("button"), QStringLiteral("left")},
-             {QStringLiteral("clickCount"), 1}},
-            request.sessionId);
-        if (commandId == 0) {
-            m_autoBookingInProgress = false;
-            m_autoBookingSeatType.clear();
-            m_autoBookingClickX = 0.0;
-            m_autoBookingClickY = 0.0;
-            stopTrainRefreshMacro();
-            showStatus(tr("자동 예매 버튼에 마우스 입력을 완료하지 못했습니다."), true);
-            return;
-        }
-        m_recorderRequests.insert(commandId,
-                                  {RecorderRequestType::AutoBookingMouseReleased,
-                                   {}, {}, request.sessionId, false});
-        return;
-    }
-    case RecorderRequestType::AutoBookingMouseReleased:
-        m_autoBookingWaitingForSelectionNotice = false;
-        m_autoBookingConfirmationAttempts = 0;
-        m_autoBookingDialogAttempts = 0;
-        m_autoBookingDialogClicks = 0;
-        m_autoBookingDialogDomFallbackUsed = false;
-        showStatus(tr("%1 좌석을 선택했습니다. 하단 예매 버튼을 누르는 중입니다...")
-                       .arg(m_autoBookingSeatType.isEmpty()
-                                ? tr("선택한")
-                                : m_autoBookingSeatType));
-        QTimer::singleShot(250, this, [this, sessionId = request.sessionId]() {
-            continueAutoBookingWithConfirmation(sessionId);
-        });
-        return;
-    case RecorderRequestType::AutoBookingConfirm: {
-        const QJsonObject value = result.value(QStringLiteral("result"))
-                                      .toObject()
-                                      .value(QStringLiteral("value"))
-                                      .toObject();
-        if (!value.value(QStringLiteral("found")).toBool()
-            || !value.value(QStringLiteral("x")).isDouble()
-            || !value.value(QStringLiteral("y")).isDouble()) {
-            if (++m_autoBookingConfirmationAttempts < 10) {
-                QTimer::singleShot(250, this, [this, sessionId = request.sessionId]() {
-                    continueAutoBookingWithConfirmation(sessionId);
-                });
-                return;
-            }
-            m_autoBookingInProgress = false;
-            m_autoBookingSeatType.clear();
-            m_autoBookingClickX = 0.0;
-            m_autoBookingClickY = 0.0;
-            m_autoBookingConfirmationAttempts = 0;
-            m_autoBookingWaitingForSelectionNotice = false;
-            stopTrainRefreshMacro();
-            showStatus(tr("좌석은 선택됐지만 하단 예매 버튼을 찾지 못했습니다."), true);
-            return;
-        }
-
-        m_autoBookingClickX = value.value(QStringLiteral("x")).toDouble();
-        m_autoBookingClickY = value.value(QStringLiteral("y")).toDouble();
-        const int commandId = sendRecorderCommand(
-            QStringLiteral("Input.dispatchMouseEvent"),
-            {{QStringLiteral("type"), QStringLiteral("mousePressed")},
-             {QStringLiteral("x"), m_autoBookingClickX},
-             {QStringLiteral("y"), m_autoBookingClickY},
-             {QStringLiteral("button"), QStringLiteral("left")},
-             {QStringLiteral("clickCount"), 1}},
-            request.sessionId);
-        if (commandId == 0) {
-            m_autoBookingInProgress = false;
-            m_autoBookingSeatType.clear();
-            m_autoBookingClickX = 0.0;
-            m_autoBookingClickY = 0.0;
-            m_autoBookingConfirmationAttempts = 0;
-            m_autoBookingWaitingForSelectionNotice = false;
-            stopTrainRefreshMacro();
-            showStatus(tr("하단 예매 버튼에 마우스 입력을 보낼 수 없습니다."), true);
-            return;
-        }
-        m_recorderRequests.insert(commandId,
-                                  {RecorderRequestType::AutoBookingConfirmMousePressed,
-                                   {}, {}, request.sessionId, false});
-        return;
-    }
-    case RecorderRequestType::AutoBookingConfirmMousePressed: {
-        const int commandId = sendRecorderCommand(
-            QStringLiteral("Input.dispatchMouseEvent"),
-            {{QStringLiteral("type"), QStringLiteral("mouseReleased")},
-             {QStringLiteral("x"), m_autoBookingClickX},
-             {QStringLiteral("y"), m_autoBookingClickY},
-             {QStringLiteral("button"), QStringLiteral("left")},
-             {QStringLiteral("clickCount"), 1}},
-            request.sessionId);
-        if (commandId == 0) {
-            m_autoBookingInProgress = false;
-            m_autoBookingSeatType.clear();
-            m_autoBookingClickX = 0.0;
-            m_autoBookingClickY = 0.0;
-            m_autoBookingConfirmationAttempts = 0;
-            m_autoBookingWaitingForSelectionNotice = false;
-            stopTrainRefreshMacro();
-            showStatus(tr("하단 예매 버튼에 마우스 입력을 완료하지 못했습니다."), true);
-            return;
-        }
-        m_recorderRequests.insert(commandId,
-                                  {RecorderRequestType::AutoBookingConfirmMouseReleased,
-                                   {}, {}, request.sessionId, false});
-        return;
-    }
-    case RecorderRequestType::AutoBookingConfirmMouseReleased:
-        m_autoBookingWaitingForSelectionNotice = false;
-        m_autoBookingDialogAttempts = 0;
-        m_autoBookingDialogClicks = 0;
-        m_autoBookingDialogDomFallbackUsed = false;
-        showStatus(tr("하단 예매 버튼을 눌렀습니다. 안내 메시지를 확인하는 중입니다..."));
-        QTimer::singleShot(150, this, [this, sessionId = request.sessionId]() {
-            continueAutoBookingWithInformationalDialogs(sessionId);
-        });
-        return;
-    case RecorderRequestType::AutoBookingDismissDialog: {
-        const QJsonObject value = result.value(QStringLiteral("result"))
-                                      .toObject()
-                                      .value(QStringLiteral("value"))
-                                      .toObject();
-        if (value.value(QStringLiteral("clicked")).toBool()) {
-            ++m_autoBookingDialogClicks;
-            m_autoBookingDialogAttempts = 0;
-            m_autoBookingDialogDomFallbackUsed = true;
-            showStatus(tr("안내 메시지의 확인 버튼을 다시 눌렀습니다. 닫힘을 확인하는 중입니다..."));
-            QTimer::singleShot(250, this, [this, sessionId = request.sessionId]() {
-                continueAutoBookingWithInformationalDialogs(sessionId);
-            });
-            return;
-        }
-        if (!value.value(QStringLiteral("found")).toBool()
-            || !value.value(QStringLiteral("x")).isDouble()
-            || !value.value(QStringLiteral("y")).isDouble()) {
-            if (++m_autoBookingDialogAttempts < 12) {
-                QTimer::singleShot(250, this, [this, sessionId = request.sessionId]() {
-                    continueAutoBookingWithInformationalDialogs(sessionId);
-                });
-                return;
-            }
-
-            m_autoBookingInProgress = false;
-            m_autoBookingSeatType.clear();
-            m_autoBookingClickX = 0.0;
-            m_autoBookingClickY = 0.0;
-            m_autoBookingConfirmationAttempts = 0;
-            m_autoBookingDialogAttempts = 0;
-            m_autoBookingDialogClicks = 0;
-            m_autoBookingDialogDomFallbackUsed = false;
-            m_autoBookingWaitingForSelectionNotice = false;
-            stopTrainRefreshMacro();
-            showStatus(tr("하단 예매 버튼을 눌렀습니다. 예매 화면으로 전환되는지 확인하세요."));
-            return;
-        }
-
-        m_autoBookingClickX = value.value(QStringLiteral("x")).toDouble();
-        m_autoBookingClickY = value.value(QStringLiteral("y")).toDouble();
-        const int commandId = sendRecorderCommand(
-            QStringLiteral("Input.dispatchMouseEvent"),
-            {{QStringLiteral("type"), QStringLiteral("mousePressed")},
-             {QStringLiteral("x"), m_autoBookingClickX},
-             {QStringLiteral("y"), m_autoBookingClickY},
-             {QStringLiteral("button"), QStringLiteral("left")},
-             {QStringLiteral("clickCount"), 1}},
-            request.sessionId);
-        if (commandId == 0) {
-            m_autoBookingInProgress = false;
-            m_autoBookingSeatType.clear();
-            m_autoBookingClickX = 0.0;
-            m_autoBookingClickY = 0.0;
-            m_autoBookingConfirmationAttempts = 0;
-            m_autoBookingDialogAttempts = 0;
-            m_autoBookingDialogClicks = 0;
-            m_autoBookingDialogDomFallbackUsed = false;
-            m_autoBookingWaitingForSelectionNotice = false;
-            stopTrainRefreshMacro();
-            showStatus(tr("안내 메시지의 확인 버튼에 마우스 입력을 보낼 수 없습니다."), true);
-            return;
-        }
-        m_recorderRequests.insert(commandId,
-                                  {RecorderRequestType::AutoBookingDismissDialogMousePressed,
-                                   {}, {}, request.sessionId, false});
-        return;
-    }
-    case RecorderRequestType::AutoBookingDismissDialogMousePressed: {
-        const int commandId = sendRecorderCommand(
-            QStringLiteral("Input.dispatchMouseEvent"),
-            {{QStringLiteral("type"), QStringLiteral("mouseReleased")},
-             {QStringLiteral("x"), m_autoBookingClickX},
-             {QStringLiteral("y"), m_autoBookingClickY},
-             {QStringLiteral("button"), QStringLiteral("left")},
-             {QStringLiteral("clickCount"), 1}},
-            request.sessionId);
-        if (commandId == 0) {
-            m_autoBookingInProgress = false;
-            m_autoBookingSeatType.clear();
-            m_autoBookingClickX = 0.0;
-            m_autoBookingClickY = 0.0;
-            m_autoBookingConfirmationAttempts = 0;
-            m_autoBookingDialogAttempts = 0;
-            m_autoBookingDialogClicks = 0;
-            m_autoBookingDialogDomFallbackUsed = false;
-            m_autoBookingWaitingForSelectionNotice = false;
-            stopTrainRefreshMacro();
-            showStatus(tr("안내 메시지의 확인 버튼에 마우스 입력을 완료하지 못했습니다."), true);
-            return;
-        }
-        m_recorderRequests.insert(commandId,
-                                  {RecorderRequestType::AutoBookingDismissDialogMouseReleased,
-                                   {}, {}, request.sessionId, false});
-        return;
-    }
-    case RecorderRequestType::AutoBookingDismissDialogMouseReleased:
-        ++m_autoBookingDialogClicks;
-        m_autoBookingDialogAttempts = 0;
-        if (m_autoBookingDialogClicks >= 3) {
-            m_autoBookingInProgress = false;
-            m_autoBookingSeatType.clear();
-            m_autoBookingClickX = 0.0;
-            m_autoBookingClickY = 0.0;
-            m_autoBookingConfirmationAttempts = 0;
-            m_autoBookingDialogAttempts = 0;
-            m_autoBookingDialogClicks = 0;
-            m_autoBookingDialogDomFallbackUsed = false;
-            m_autoBookingWaitingForSelectionNotice = false;
-            stopTrainRefreshMacro();
-            showStatus(tr("안내 메시지를 확인하고 예매를 진행했습니다."));
-            return;
-        }
-        showStatus(tr("안내 메시지의 확인 버튼을 눌렀습니다. 예매 화면으로 이동하는 중입니다..."));
-        QTimer::singleShot(200, this, [this, sessionId = request.sessionId]() {
-            continueAutoBookingWithInformationalDialogs(sessionId);
-        });
-        return;
+    bool isTicketReservationPage = false;
+    const QList<TrainInfo> trains = TrainInfoParser::parse(snapshot, &isTicketReservationPage);
+    if (isTicketReservationPage) {
+        m_trainInfoSessionId = sessionId;
+        updateTrainInfoTable(trains);
+        m_autoBookingController->setTrainInfoContext(sessionId, selectedTrains());
+    } else if (sessionId == m_trainInfoSessionId) {
+        clearTrainInfoTable();
     }
 }
 
-void MainWindow::onRecorderSocketDisconnected()
+void MainWindow::updateTrainInfoTable(const QList<TrainInfo> &trains)
 {
-    const bool wasRecording = isRecorderRequested() || isRecorderActive();
-    m_pageRecordingActive = false;
-    m_pageRecordingRequested = false;
-    m_trainInfoMonitoringActive = false;
-    m_trainInfoMonitoringRequested = false;
-    m_autoBookingInProgress = false;
-    m_autoBookingSeatType.clear();
-    m_autoBookingClickX = 0.0;
-    m_autoBookingClickY = 0.0;
-    m_autoBookingConfirmationAttempts = 0;
-    m_autoBookingDialogAttempts = 0;
-    m_autoBookingDialogClicks = 0;
-    m_autoBookingDialogDomFallbackUsed = false;
-    m_autoBookingWaitingForSelectionNotice = false;
-    m_recorderRequests.clear();
-    m_recorderSessions.clear();
-    m_targetToRecorderSession.clear();
-    clearTrainInfoTable();
-    ui->pageRecordingButton->setEnabled(true);
-    ui->pageRecordingButton->setText(tr("방문 페이지 기록 시작"));
-
-    if (wasRecording) {
-        showStatus(tr("열차 정보 수집용 CDP 연결이 끊어졌습니다."), true);
-    }
-}
-
-int MainWindow::sendRecorderCommand(const QString &method,
-                                    const QJsonObject &parameters,
-                                    const QString &sessionId)
-{
-    if (m_recorderSocket.state() != QAbstractSocket::ConnectedState) {
-        return 0;
-    }
-
-    const int commandId = m_nextRecorderCommandId++;
-    QJsonObject command {
-        {QStringLiteral("id"), commandId},
-        {QStringLiteral("method"), method}
-    };
-    if (!parameters.isEmpty()) {
-        command.insert(QStringLiteral("params"), parameters);
-    }
-    if (!sessionId.isEmpty()) {
-        command.insert(QStringLiteral("sessionId"), sessionId);
-    }
-
-    m_recorderSocket.sendTextMessage(
-        QString::fromUtf8(QJsonDocument(command).toJson(QJsonDocument::Compact)));
-    return commandId;
-}
-
-void MainWindow::handleRecorderEvent(const QJsonObject &event)
-{
-    if (!isRecorderActive()) {
-        return;
-    }
-
-    const QString method = event.value(QStringLiteral("method")).toString();
-    const QJsonObject parameters = event.value(QStringLiteral("params")).toObject();
-    if (method == QStringLiteral("Page.javascriptDialogOpening")) {
-        const QString sessionId = event.value(QStringLiteral("sessionId")).toString();
-        const QString dialogType = parameters.value(QStringLiteral("type")).toString();
-        if (dialogType == QStringLiteral("alert") && !sessionId.isEmpty()) {
-            sendRecorderCommand(QStringLiteral("Page.handleJavaScriptDialog"),
-                                {{QStringLiteral("accept"), true}}, sessionId);
-            showStatus(tr("안내 메시지를 자동으로 확인했습니다."));
-        }
-        return;
-    }
-    if (method == QStringLiteral("Target.attachedToTarget")) {
-        attachRecorderToPage(parameters);
-        return;
-    }
-    if (method == QStringLiteral("Target.detachedFromTarget")) {
-        const QString sessionId = parameters.value(QStringLiteral("sessionId")).toString();
-        const bool wasTrainInfoSession = sessionId == m_trainInfoSessionId;
-        if (m_recorderSessions.contains(sessionId)) {
-            m_targetToRecorderSession.remove(m_recorderSessions.value(sessionId).targetId);
-            m_recorderSessions.remove(sessionId);
-        }
-        if (wasTrainInfoSession) {
-            clearTrainInfoTable();
-        }
-        return;
-    }
-    if (method == QStringLiteral("Target.targetInfoChanged")) {
-        const QJsonObject targetInfo = parameters.value(QStringLiteral("targetInfo")).toObject();
-        const QString targetId = targetInfo.value(QStringLiteral("targetId")).toString();
-        const QString sessionId = m_targetToRecorderSession.value(targetId);
-        if (!sessionId.isEmpty() && m_recorderSessions.contains(sessionId)) {
-            RecorderSession &session = m_recorderSessions[sessionId];
-            session.url = targetInfo.value(QStringLiteral("url")).toString();
-            session.title = targetInfo.value(QStringLiteral("title")).toString();
-        }
-        return;
-    }
-    if (method == QStringLiteral("Network.loadingFinished")) {
-        schedulePageSnapshot(event.value(QStringLiteral("sessionId")).toString(), 700);
-        return;
-    }
-    if (method == QStringLiteral("Page.loadEventFired")
-        || method == QStringLiteral("Page.navigatedWithinDocument")) {
-        schedulePageSnapshot(event.value(QStringLiteral("sessionId")).toString());
-    }
-}
-
-void MainWindow::attachRecorderToPage(const QJsonObject &parameters)
-{
-    const QJsonObject targetInfo = parameters.value(QStringLiteral("targetInfo")).toObject();
-    if (targetInfo.value(QStringLiteral("type")).toString() != QStringLiteral("page")) {
-        return;
-    }
-
-    const QString sessionId = parameters.value(QStringLiteral("sessionId")).toString();
-    const QString targetId = targetInfo.value(QStringLiteral("targetId")).toString();
-    if (sessionId.isEmpty() || targetId.isEmpty()) {
-        return;
-    }
-    if (m_targetToRecorderSession.contains(targetId)) {
-        sendRecorderCommand(QStringLiteral("Target.detachFromTarget"),
-                            {{QStringLiteral("sessionId"), sessionId}});
-        return;
-    }
-
-    m_recorderSessions.insert(sessionId,
-                              {targetId,
-                               targetInfo.value(QStringLiteral("url")).toString(),
-                               targetInfo.value(QStringLiteral("title")).toString(),
-                               false,
-                               false,
-                               {}});
-    m_targetToRecorderSession.insert(targetId, sessionId);
-
-    sendRecorderCommand(QStringLiteral("Page.enable"), {}, sessionId);
-    sendRecorderCommand(QStringLiteral("Network.enable"), {}, sessionId);
-    schedulePageSnapshot(sessionId, 800);
-}
-
-void MainWindow::schedulePageSnapshot(const QString &sessionId, int delayMilliseconds)
-{
-    if (!isRecorderActive() || !m_recorderSessions.contains(sessionId)) {
-        return;
-    }
-
-    RecorderSession &session = m_recorderSessions[sessionId];
-    if (session.captureScheduled || session.captureInFlight) {
-        return;
-    }
-    if (!isRecordablePageUrl(session.url)) {
-        return;
-    }
-
-    session.captureScheduled = true;
-    QTimer::singleShot(delayMilliseconds, this, [this, sessionId]() {
-        if (!isRecorderActive() || !m_recorderSessions.contains(sessionId)) {
-            return;
-        }
-
-        m_recorderSessions[sessionId].captureScheduled = false;
-        capturePageSnapshot(sessionId);
-    });
-}
-
-void MainWindow::capturePageSnapshot(const QString &sessionId)
-{
-    if (!isRecorderActive() || !m_recorderSessions.contains(sessionId)) {
-        return;
-    }
-
-    RecorderSession &session = m_recorderSessions[sessionId];
-    if (session.captureInFlight) {
-        return;
-    }
-
-    const bool saveSnapshot = m_pageRecordingActive;
-    QString captureId;
-    QString captureDirectory;
-    if (saveSnapshot) {
-        const QString snapshotDirectory = ui->snapshotDirectoryEdit->text().trimmed();
-        captureId = QDateTime::currentDateTimeUtc().toString(QStringLiteral("yyyyMMddTHHmmsszzzZ"))
-                    + QStringLiteral("-%1").arg(m_nextSnapshotSequence++);
-        captureDirectory = QDir(snapshotDirectory).filePath(captureId);
-        if (!QDir().mkpath(captureDirectory)) {
-            showStatus(tr("페이지 스냅샷 폴더를 만들 수 없습니다."), true);
-            return;
-        }
-    }
-
-    session.captureInFlight = true;
-    const int domSnapshotCommandId = sendRecorderCommand(QStringLiteral("DOMSnapshot.captureSnapshot"),
-                                                         {{QStringLiteral("computedStyles"), QJsonArray {}},
-                                                          {QStringLiteral("includeDOMRects"), true}},
-                                                         sessionId);
-    if (domSnapshotCommandId == 0) {
-        session.captureInFlight = false;
-        return;
-    }
-    m_recorderRequests.insert(domSnapshotCommandId,
-                              {RecorderRequestType::DomSnapshot, captureId, captureDirectory, sessionId,
-                               saveSnapshot});
-    return;
-
-#if 0 // Replaced by the passive DOMSnapshot path above; retained temporarily for source comparison.
-    static const QString captureExpression = QStringLiteral(R"JS(
-(() => {
-    const redacted = '[REDACTED]';
-    const redactUrl = (rawUrl) => {
-        try {
-            const url = new URL(rawUrl);
-            for (const key of Array.from(url.searchParams.keys())) {
-                if (/(pass(word)?|secret|token|auth|session|cookie|card|cvv|ssn)/i.test(key)) {
-                    url.searchParams.set(key, redacted);
-                }
-            }
-            return url.href;
-        } catch (_) {
-            return rawUrl;
-        }
-    };
-    const isSensitive = (element) => {
-        const identity = [
-            element.getAttribute('type'),
-            element.getAttribute('name'),
-            element.getAttribute('id'),
-            element.getAttribute('autocomplete')
-        ].filter(Boolean).join(' ');
-        return /(pass(word)?|secret|token|auth|session|cookie|card|cvv|ssn)/i.test(identity);
-    };
-    const cssEscape = window.CSS && CSS.escape
-        ? CSS.escape
-        : (value) => String(value).replace(/[^a-zA-Z0-9_-]/g, '\\$&');
-    const selectorFor = (element) => {
-        if (element.id) {
-            const candidate = `#${cssEscape(element.id)}`;
-            if (document.querySelectorAll(candidate).length === 1) {
-                return candidate;
-            }
-        }
-        for (const attribute of ['data-testid', 'data-test', 'data-qa', 'name', 'aria-label']) {
-            const value = element.getAttribute(attribute);
-            if (!value) {
-                continue;
-            }
-            const candidate = `${element.tagName.toLowerCase()}[${attribute}="${cssEscape(value)}"]`;
-            if (document.querySelectorAll(candidate).length === 1) {
-                return candidate;
-            }
-        }
-        const parts = [];
-        let current = element;
-        while (current && current.nodeType === Node.ELEMENT_NODE && parts.length < 8) {
-            let index = 1;
-            let sibling = current.previousElementSibling;
-            while (sibling) {
-                if (sibling.tagName === current.tagName) {
-                    ++index;
-                }
-                sibling = sibling.previousElementSibling;
-            }
-            parts.unshift(`${current.tagName.toLowerCase()}:nth-of-type(${index})`);
-            current = current.parentElement;
-        }
-        return parts.join(' > ');
-    };
-    const rootClone = document.documentElement.cloneNode(true);
-    const originals = document.querySelectorAll('input, textarea, select');
-    const clones = rootClone.querySelectorAll('input, textarea, select');
-    originals.forEach((element, index) => {
-        const clone = clones[index];
-        if (!clone) {
-            return;
-        }
-        clone.removeAttribute('value');
-        if (clone.tagName === 'TEXTAREA') {
-            clone.textContent = '';
-        }
-        if (isSensitive(element)) {
-            clone.setAttribute('data-cdp-value-redacted', 'true');
-        }
-    });
-    const actionableElements = Array.from(document.querySelectorAll(
-        'a, button, input, textarea, select, [role="button"], [role="link"], [contenteditable="true"]'
-    )).slice(0, 5000).map((element) => {
-        const rect = element.getBoundingClientRect();
-        const input = element instanceof HTMLInputElement ? element : null;
-        return {
-            selector: selectorFor(element),
-            tag: element.tagName.toLowerCase(),
-            id: element.id || '',
-            name: element.getAttribute('name') || '',
-            type: input ? input.type : '',
-            role: element.getAttribute('role') || '',
-            text: isSensitive(element) ? '' : (element.innerText || element.textContent || '').trim().slice(0, 500),
-            ariaLabel: element.getAttribute('aria-label') || '',
-            placeholder: element.getAttribute('placeholder') || '',
-            title: element.getAttribute('title') || '',
-            href: element instanceof HTMLAnchorElement ? redactUrl(element.href) : '',
-            checked: input ? input.checked : false,
-            visible: Boolean(rect.width || rect.height),
-            rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
-        };
-    });
-
-    const cleanText = (value) => String(value || '').replace(/\s+/g, ' ').trim();
-    const bodyText = cleanText(document.body && document.body.innerText);
-    const ticketReservationPage = /승차권\s*예매|열차\s*(조회|예매)|출발역\s*.*도착역/.test(bodyText);
-    const trains = [];
-    const seenRows = new Set();
-    const textFor = (element) => cleanText(element && (element.innerText || element.textContent));
-    const cellFor = (headers, values, names) => {
-        const index = headers.findIndex((header) => names.some((name) => header.includes(name)));
-        return index >= 0 ? (values[index] || '') : '';
-    };
-    const addTrainRow = (row, headers = []) => {
-        if (trains.length >= 200) {
-            return;
-        }
-        const cells = Array.from(row.querySelectorAll(':scope > th, :scope > td'));
-        const values = cells.map(textFor).filter(Boolean);
-        const rowText = cleanText(values.join(' '));
-        const times = rowText.match(/(?:[01]?\d|2[0-3]):[0-5]\d/g) || [];
-        const hasBookingInfo = /예매|예약|좌석|매진|입석|잔여|특실|일반실/.test(rowText);
-        if (times.length < 2 || !hasBookingInfo) {
-            return;
-        }
-
-        const normalizedHeaders = headers.map(cleanText);
-        const trainType = cellFor(normalizedHeaders, values, ['열차종류', '열차명', '열차'])
-            || (rowText.match(/KTX(?:-산천)?|SRT|ITX-?(?:새마을|마음)|새마을호|무궁화호|누리로|통근열차/i) || [''])[0];
-        const trainNumber = row.getAttribute('data-train-no')
-            || row.getAttribute('data-trainno')
-            || row.getAttribute('data-train-number')
-            || cellFor(normalizedHeaders, values, ['열차번호', '번호'])
-            || (rowText.match(/(?:열차\s*번호\s*)?(\d{3,5})\s*호?/) || ['', ''])[1];
-        const stationPair = rowText.match(/([가-힣A-Za-z0-9]+)\s*(?:역)?\s*(?:→|->|~|-)\s*([가-힣A-Za-z0-9]+)\s*(?:역)?/);
-        const departure = cellFor(normalizedHeaders, values, ['출발역', '출발지'])
-            || (stationPair ? stationPair[1] : '');
-        const arrival = cellFor(normalizedHeaders, values, ['도착역', '도착지'])
-            || (stationPair ? stationPair[2] : '');
-        const departureTime = cellFor(normalizedHeaders, values, ['출발시간', '출발 시각']) || times[0];
-        const arrivalTime = cellFor(normalizedHeaders, values, ['도착시간', '도착 시각']) || times[1];
-        const availability = values.filter((value) => /예매|예약|좌석|매진|입석|잔여|특실|일반실/.test(value))
-            .join(' / ');
-        const signature = [trainType, trainNumber, departure, departureTime, arrival, arrivalTime, availability]
-            .join('|');
-        if (seenRows.has(signature)) {
-            return;
-        }
-        seenRows.add(signature);
-        trains.push({ trainType, trainNumber, departure, departureTime, arrival, arrivalTime, availability });
-    };
-
-    Array.from(document.querySelectorAll('table')).forEach((table) => {
-        const headers = Array.from(table.querySelectorAll('thead th')).map(textFor);
-        Array.from(table.querySelectorAll('tbody tr')).forEach((row) => addTrainRow(row, headers));
-    });
-    Array.from(document.querySelectorAll('[data-train-no], [data-trainno], [data-train-number]'))
-        .forEach((element) => addTrainRow(element.closest('tr') || element));
-
-    return {
-        capturedAt: new Date().toISOString(),
-        url: redactUrl(location.href),
-        title: document.title,
-        readyState: document.readyState,
-        viewport: { width: window.innerWidth, height: window.innerHeight, devicePixelRatio: window.devicePixelRatio },
-        ticketReservationPage,
-        trains,
-        documentHtml: '<!DOCTYPE html>\n' + rootClone.outerHTML,
-        actionableElements
-    };
-})()
-)JS");
-
-    session.captureInFlight = true;
-    const int pageCommandId = sendRecorderCommand(QStringLiteral("Runtime.evaluate"),
-                                                  {{QStringLiteral("expression"), captureExpression},
-                                                   {QStringLiteral("returnByValue"), true},
-                                                   {QStringLiteral("awaitPromise"), true}},
-                                                  sessionId);
-    if (pageCommandId == 0) {
-        session.captureInFlight = false;
-        return;
-    }
-    m_recorderRequests.insert(pageCommandId,
-                              {RecorderRequestType::PageData, captureId, captureDirectory, sessionId});
-
-    const int domCommandId = sendRecorderCommand(QStringLiteral("DOMSnapshot.captureSnapshot"),
-                                                 {{QStringLiteral("computedStyles"), QJsonArray {}},
-                                                  {QStringLiteral("includeDOMRects"), true}},
-                                                 sessionId);
-    if (domCommandId != 0) {
-        m_recorderRequests.insert(domCommandId,
-                                  {RecorderRequestType::DomSnapshot, captureId, captureDirectory, sessionId});
-    }
-#endif
-}
-
-void MainWindow::updateTrainInfoTable(const QJsonArray &trains)
-{
+    m_currentTrains = trains;
     m_updatingTrainInfoTable = true;
     ui->trainInfoTableWidget->setUpdatesEnabled(false);
     ui->trainInfoTableWidget->setRowCount(0);
-
-    for (const QJsonValue &value : trains) {
-        const QJsonObject train = value.toObject();
+    for (const TrainInfo &train : trains) {
         const int row = ui->trainInfoTableWidget->rowCount();
         ui->trainInfoTableWidget->insertRow(row);
-        const QString selectionKey = trainSelectionKey(train);
+        const QString selectionKey = TrainInfoParser::selectionKey(train);
         auto *selectionItem = new QTableWidgetItem;
         selectionItem->setFlags(selectionItem->flags() | Qt::ItemIsUserCheckable);
         selectionItem->setData(Qt::UserRole, selectionKey);
-        selectionItem->setCheckState(m_selectedTrainKeys.contains(selectionKey)
-                                         ? Qt::Checked
-                                         : Qt::Unchecked);
+        selectionItem->setCheckState(m_selectedTrainKeys.contains(selectionKey) ? Qt::Checked : Qt::Unchecked);
         selectionItem->setToolTip(tr("이 열차 선택"));
         ui->trainInfoTableWidget->setItem(row, 0, selectionItem);
-        const QStringList columns {
-            train.value(QStringLiteral("trainType")).toString(),
-            train.value(QStringLiteral("trainNumber")).toString(),
-            train.value(QStringLiteral("departure")).toString(),
-            train.value(QStringLiteral("departureTime")).toString(),
-            train.value(QStringLiteral("arrival")).toString(),
-            train.value(QStringLiteral("arrivalTime")).toString(),
-            train.value(QStringLiteral("duration")).toString(),
-            train.value(QStringLiteral("generalSeat")).toString(),
-            train.value(QStringLiteral("specialSeat")).toString()
-        };
+        const QStringList columns {train.trainType, train.trainNo, train.departure, train.departureTime,
+                                   train.arrival, train.arrivalTime, train.duration, train.generalSeat,
+                                   train.specialSeat};
         for (int column = 0; column < columns.size(); ++column) {
             auto *item = new QTableWidgetItem(columns.at(column));
             item->setToolTip(columns.at(column));
             ui->trainInfoTableWidget->setItem(row, column + 1, item);
         }
     }
-
     ui->trainInfoTableWidget->setUpdatesEnabled(true);
     m_updatingTrainInfoTable = false;
     ui->trainInfoGroupBox->setTitle(tr("열차 정보 (%1건)").arg(trains.size()));
@@ -1678,8 +270,10 @@ void MainWindow::updateTrainInfoTable(const QJsonArray &trains)
 void MainWindow::clearTrainInfoTable()
 {
     stopTrainRefreshMacro();
+    m_currentTrains.clear();
     m_selectedTrainKeys.clear();
     m_trainInfoSessionId.clear();
+    m_autoBookingController->setTrainInfoContext({}, {});
     ui->trainInfoTableWidget->setRowCount(0);
     ui->trainInfoGroupBox->setTitle(tr("열차 정보 (열차 조회 페이지 대기 중)"));
     ui->trainInfoGroupBox->setVisible(true);
@@ -1690,600 +284,33 @@ void MainWindow::onTrainInfoItemChanged(QTableWidgetItem *item)
     if (m_updatingTrainInfoTable || !item || item->column() != 0) {
         return;
     }
-
     const QString selectionKey = item->data(Qt::UserRole).toString();
     if (selectionKey.isEmpty()) {
         return;
     }
-
     if (item->checkState() == Qt::Checked) {
         m_selectedTrainKeys.insert(selectionKey);
     } else {
         m_selectedTrainKeys.remove(selectionKey);
     }
-    updateSelectedTrainRefresh();
+    m_autoBookingController->setSelectedTrains(selectedTrains());
 }
 
-void MainWindow::startTrainRefreshMacro()
+QList<TrainInfo> MainWindow::selectedTrains() const
 {
-    m_trainRefreshMacroActive = true;
-    ui->startTrainRefreshMacroButton->setEnabled(false);
-    ui->stopTrainRefreshMacroButton->setEnabled(true);
-
-    startTrainInfoMonitoring();
-    if (!isRecorderRequested() && !isRecorderActive()) {
-        stopTrainRefreshMacro();
-        return;
-    }
-    updateSelectedTrainRefresh();
-}
-
-void MainWindow::stopTrainRefreshMacro(const QString &message)
-{
-    const bool wasActive = m_trainRefreshMacroActive;
-    m_trainRefreshMacroActive = false;
-    m_selectedTrainRefreshTimer.stop();
-    ui->startTrainRefreshMacroButton->setEnabled(true);
-    ui->stopTrainRefreshMacroButton->setEnabled(false);
-    if (wasActive && !message.isEmpty()) {
-        showStatus(message);
-    }
-}
-
-void MainWindow::updateSelectedTrainRefresh()
-{
-    if (!m_trainRefreshMacroActive) {
-        m_selectedTrainRefreshTimer.stop();
-        return;
-    }
-    if (m_autoBookingInProgress) {
-        m_selectedTrainRefreshTimer.stop();
-        return;
-    }
-    if (m_selectedTrainKeys.isEmpty()) {
-        m_selectedTrainRefreshTimer.stop();
-        showStatus(tr("매크로가 준비되었습니다. 예매 가능 여부를 확인할 열차를 선택하세요."));
-        return;
-    }
-    if (hasReservableSelectedTrain()) {
-        if (ui->autoBookWhenAvailableCheckBox->isChecked()) {
-            startAutoBookingForReservableTrain();
-            return;
-        }
-        stopTrainRefreshMacro(tr("선택한 열차에서 예매 가능한 좌석을 찾았습니다."));
-        return;
-    }
-    if (!isRecorderActive() || m_trainInfoSessionId.isEmpty()
-        || !m_recorderSessions.contains(m_trainInfoSessionId)) {
-        return;
-    }
-    if (!m_selectedTrainRefreshTimer.isActive()) {
-        showStatus(tr("선택한 열차의 예매 가능 여부를 확인 중입니다. %1초 후 페이지를 새로고침합니다.")
-                       .arg(ui->macroRefreshIntervalSpinBox->value()));
-        m_selectedTrainRefreshTimer.start();
-    }
-}
-
-void MainWindow::refreshSelectedTrainPage()
-{
-    if (!m_trainRefreshMacroActive || m_selectedTrainKeys.isEmpty()
-        || m_autoBookingInProgress) {
-        return;
-    }
-    if (hasReservableSelectedTrain()) {
-        updateSelectedTrainRefresh();
-        return;
-    }
-    if (!isRecorderActive() || m_trainInfoSessionId.isEmpty()
-        || !m_recorderSessions.contains(m_trainInfoSessionId)) {
-        return;
-    }
-    if (sendRecorderCommand(QStringLiteral("Page.reload"), {}, m_trainInfoSessionId) == 0) {
-        stopTrainRefreshMacro();
-        showStatus(tr("선택한 열차 정보를 새로고침하지 못했습니다."), true);
-        return;
-    }
-    showStatus(tr("선택한 열차의 예매 가능 여부를 다시 확인하기 위해 페이지를 새로고침했습니다."));
-}
-
-bool MainWindow::hasReservableSelectedTrain() const
-{
-    return !reservableSelectedTrain().isEmpty();
-}
-
-QJsonObject MainWindow::reservableSelectedTrain() const
-{
-    for (int row = 0; row < ui->trainInfoTableWidget->rowCount(); ++row) {
-        const QTableWidgetItem *selectionItem = ui->trainInfoTableWidget->item(row, 0);
-        if (!selectionItem || selectionItem->checkState() != Qt::Checked) {
-            continue;
-        }
-
-        const QTableWidgetItem *generalSeatItem = ui->trainInfoTableWidget->item(row, 8);
-        const QTableWidgetItem *specialSeatItem = ui->trainInfoTableWidget->item(row, 9);
-        const bool generalReservable = generalSeatItem && isReservableSeatText(generalSeatItem->text());
-        const bool specialReservable = specialSeatItem && isReservableSeatText(specialSeatItem->text());
-        if (generalReservable || specialReservable) {
-            const auto textAt = [this, row](int column) {
-                const QTableWidgetItem *item = ui->trainInfoTableWidget->item(row, column);
-                return item ? item->text() : QString();
-            };
-            return {{QStringLiteral("trainType"), textAt(1)},
-                    {QStringLiteral("trainNumber"), textAt(2)},
-                    {QStringLiteral("departure"), textAt(3)},
-                    {QStringLiteral("departureTime"), textAt(4)},
-                    {QStringLiteral("arrival"), textAt(5)},
-                    {QStringLiteral("arrivalTime"), textAt(6)},
-                    {QStringLiteral("generalReservable"), generalReservable},
-                    {QStringLiteral("specialReservable"), specialReservable}};
+    QList<TrainInfo> selected;
+    for (const TrainInfo &train : m_currentTrains) {
+        if (m_selectedTrainKeys.contains(TrainInfoParser::selectionKey(train))) {
+            selected.append(train);
         }
     }
-    return {};
+    return selected;
 }
 
-void MainWindow::startAutoBookingForReservableTrain()
+void MainWindow::updatePageRecordingUi(bool active)
 {
-    if (!m_trainRefreshMacroActive || m_autoBookingInProgress || !isRecorderActive()
-        || m_trainInfoSessionId.isEmpty() || !m_recorderSessions.contains(m_trainInfoSessionId)) {
-        return;
-    }
-
-    const QJsonObject train = reservableSelectedTrain();
-    if (train.isEmpty()) {
-        return;
-    }
-    if (train.value(QStringLiteral("trainNumber")).toString().isEmpty()
-        || train.value(QStringLiteral("departureTime")).toString().isEmpty()
-        || train.value(QStringLiteral("arrivalTime")).toString().isEmpty()) {
-        stopTrainRefreshMacro();
-        showStatus(tr("자동 예매에 필요한 열차 번호 또는 운행 시각을 확인하지 못했습니다."), true);
-        return;
-    }
-
-    const QString expression = QStringLiteral(R"JS(
-(() => {
-    const train = %1;
-    const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
-    const rowMatches = (row) => {
-        const text = clean(row.innerText || row.textContent);
-        return [train.trainType, train.trainNumber, train.departure, train.departureTime,
-                train.arrival, train.arrivalTime]
-            .filter(Boolean)
-            .every((part) => text.includes(clean(part)));
-    };
-    const isReservable = (text) => {
-        const value = clean(text);
-        return (/예매|예약|\b\d{1,3}(?:,\d{3})*\s*원/.test(value))
-            && !/매진|없음|불가|대기/.test(value);
-    };
-    const isUsable = (element) => {
-        if (!element || element.disabled || element.getAttribute('aria-disabled') === 'true'
-            || /disabled|disable|soldout|sold-out/i.test(element.className || '')) {
-            return false;
-        }
-        const style = window.getComputedStyle(element);
-        const rect = element.getBoundingClientRect();
-        return style.display !== 'none' && style.visibility !== 'hidden'
-            && rect.width > 0 && rect.height > 0;
-    };
-    const actionSelector = 'a, button, input[type="button"], input[type="submit"], [role="button"]';
-    const actionText = (element) => clean([
-        element.innerText, element.value, element.textContent,
-        element.getAttribute('aria-label'), element.getAttribute('title')
-    ].filter(Boolean).join(' '));
-    const isReservationControl = (element) => isUsable(element) && isReservable(actionText(element));
-    const rows = Array.from(document.querySelectorAll(
-        'li.tckList, tr, [data-train-no], [data-trainno], [data-train-number]'
-    )).map((element) => element.closest('li.tckList, tr') || element);
-    const row = rows.find(rowMatches);
-    if (!row) {
-        return { found: false, message: '선택한 열차 행을 찾지 못했습니다.' };
-    }
-    const seatTypes = [
-        { name: '일반실', selector: '.gen, .general, .normal, [class*="gen"], [class*="general"]', available: train.generalReservable },
-        { name: '특실', selector: '.spe, .special, [class*="spe"], [class*="special"]', available: train.specialReservable }
-    ];
-    const rowControls = Array.from(row.querySelectorAll(actionSelector)).filter(isReservationControl);
-    const pointFor = (control, seatType) => {
-        control.scrollIntoView({ block: 'center', inline: 'center' });
-        const rect = control.getBoundingClientRect();
-        if (rect.width <= 0 || rect.height <= 0) {
-            return null;
-        }
-        return { found: true, seatType, x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
-    };
-    for (const seat of seatTypes) {
-        if (!seat.available) {
-            continue;
-        }
-        for (const container of Array.from(row.querySelectorAll(seat.selector))) {
-            if (!isReservable(container.innerText || container.textContent)) {
-                continue;
-            }
-            const controls = (container.matches(actionSelector) ? [container] : [])
-                .concat(Array.from(container.querySelectorAll(actionSelector)));
-            const control = controls.find(isReservationControl);
-            const point = control ? pointFor(control, seat.name) : null;
-            if (point) {
-                return point;
-            }
-            const containerPoint = pointFor(container, seat.name);
-            if (containerPoint) {
-                return containerPoint;
-            }
-        }
-
-        const seatKeyword = seat.name === '일반실' ? /일반|general|normal|gen/i : /특실|special|spe/i;
-        const control = rowControls.find((candidate) => {
-            let current = candidate;
-            for (let depth = 0; current && current !== row && depth < 4; ++depth, current = current.parentElement) {
-                const context = clean([
-                    current.className, current.id, current.getAttribute('data-seat-class'),
-                    current.getAttribute('aria-label'), current.innerText
-                ].filter(Boolean).join(' '));
-                if (seatKeyword.test(context)) {
-                    return true;
-                }
-            }
-            return false;
-        });
-        const point = control ? pointFor(control, seat.name) : null;
-        if (point) {
-            return point;
-        }
-    }
-    if (rowControls.length === 1) {
-        return pointFor(rowControls[0], '예매 가능 좌석');
-    }
-    return { found: false, message: '예매 가능한 좌석의 예매 버튼을 찾지 못했습니다.' };
-})()
-)JS")
-                                   .arg(QString::fromUtf8(QJsonDocument(train)
-                                                              .toJson(QJsonDocument::Compact)));
-
-    m_autoBookingWaitingForSelectionNotice = false;
-    m_autoBookingConfirmationAttempts = 0;
-    m_autoBookingDialogAttempts = 0;
-    m_autoBookingDialogClicks = 0;
-    m_autoBookingDialogDomFallbackUsed = false;
-    m_autoBookingInProgress = true;
-    m_selectedTrainRefreshTimer.stop();
-    const int commandId = sendRecorderCommand(QStringLiteral("Runtime.evaluate"),
-                                              {{QStringLiteral("expression"), expression},
-                                               {QStringLiteral("returnByValue"), true},
-                                               {QStringLiteral("awaitPromise"), true},
-                                               {QStringLiteral("userGesture"), true}},
-                                              m_trainInfoSessionId);
-    if (commandId == 0) {
-        m_autoBookingInProgress = false;
-        stopTrainRefreshMacro();
-        showStatus(tr("자동 예매 명령을 보낼 수 없습니다."), true);
-        return;
-    }
-    m_recorderRequests.insert(commandId,
-                              {RecorderRequestType::AutoBooking, {}, {}, m_trainInfoSessionId, false});
-    showStatus(tr("예매 가능한 좌석을 찾아 자동 예매를 시도하는 중입니다..."));
-}
-
-void MainWindow::continueAutoBookingWithConfirmation(const QString &sessionId)
-{
-    if (!m_trainRefreshMacroActive || !m_autoBookingInProgress || sessionId.isEmpty()
-        || !isRecorderActive() || !m_recorderSessions.contains(sessionId)) {
-        return;
-    }
-
-    const QString expression = QStringLiteral(R"JS(
-(() => {
-    const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
-    const textFor = (element) => clean([
-        element.innerText, element.value, element.textContent,
-        element.getAttribute('aria-label'), element.getAttribute('title')
-    ].filter(Boolean).join(' '));
-    const isUsable = (element) => {
-        if (!element || element.disabled || element.getAttribute('aria-disabled') === 'true'
-            || /disabled|disable/i.test(element.className || '')) {
-            return false;
-        }
-        const style = window.getComputedStyle(element);
-        const rect = element.getBoundingClientRect();
-        return style.display !== 'none' && style.visibility !== 'hidden'
-            && rect.width > 0 && rect.height > 0;
-    };
-    const isBookingLabel = (element) =>
-        /(^|\s)예매(?=\s|$)/.test(textFor(element)) && !/예약대기/.test(textFor(element));
-    const bottomReservationButtons = Array.from(document.querySelectorAll(
-        '.ticket_reserv_wrap button.reservbtn:not([disabled]), '
-        + '.ticket_reserv_wrap button.btn_bn-blue02:not([disabled])'
-    )).filter((element) => isUsable(element) && isBookingLabel(element));
-    const controls = bottomReservationButtons.length > 0
-        ? bottomReservationButtons
-        : Array.from(document.querySelectorAll('body *'))
-              .filter((element) => isUsable(element) && isBookingLabel(element));
-    if (controls.length === 0) {
-        return { found: false };
-    }
-    controls.sort((left, right) => {
-        const leftRect = left.getBoundingClientRect();
-        const rightRect = right.getBoundingClientRect();
-        if (rightRect.top !== leftRect.top) {
-            return rightRect.top - leftRect.top;
-        }
-        return (rightRect.width * rightRect.height) - (leftRect.width * leftRect.height);
-    });
-    const control = controls[0];
-    control.scrollIntoView({ block: 'center', inline: 'center' });
-    const rect = control.getBoundingClientRect();
-    return { found: true, x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
-})()
-)JS");
-
-    const int commandId = sendRecorderCommand(QStringLiteral("Runtime.evaluate"),
-                                              {{QStringLiteral("expression"), expression},
-                                               {QStringLiteral("returnByValue"), true},
-                                               {QStringLiteral("awaitPromise"), true},
-                                               {QStringLiteral("userGesture"), true}},
-                                              sessionId);
-    if (commandId == 0) {
-        m_autoBookingInProgress = false;
-        m_autoBookingSeatType.clear();
-        m_autoBookingClickX = 0.0;
-        m_autoBookingClickY = 0.0;
-        m_autoBookingConfirmationAttempts = 0;
-        m_autoBookingWaitingForSelectionNotice = false;
-        stopTrainRefreshMacro();
-        showStatus(tr("하단 예매 버튼을 확인할 수 없습니다."), true);
-        return;
-    }
-    m_recorderRequests.insert(commandId,
-                              {RecorderRequestType::AutoBookingConfirm, {}, {}, sessionId, false});
-}
-
-void MainWindow::continueAutoBookingWithInformationalDialogs(const QString &sessionId)
-{
-    if (!m_trainRefreshMacroActive || !m_autoBookingInProgress || sessionId.isEmpty()
-        || !isRecorderActive() || !m_recorderSessions.contains(sessionId)) {
-        return;
-    }
-
-    const QString expression = QStringLiteral(R"JS(
-(() => {
-    const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
-    const isVisible = (element) => {
-        if (!element) {
-            return false;
-        }
-        const style = window.getComputedStyle(element);
-        const rect = element.getBoundingClientRect();
-        return style.display !== 'none' && style.visibility !== 'hidden'
-            && rect.width > 0 && rect.height > 0;
-    };
-    const labelFor = (element) => clean(
-        element.innerText || element.value || element.textContent
-        || element.getAttribute('aria-label') || element.getAttribute('title')
-    );
-    const isUsable = (element) => isVisible(element)
-        && !element.disabled && element.getAttribute('aria-disabled') !== 'true';
-    const dialogs = [
-        document.getElementById('layerPopup'),
-        ...document.querySelectorAll('[role="dialog"], .layerPopup, .layer_wrap, .modal, .popup')
-    ].filter((element, index, elements) => element && elements.indexOf(element) === index && isVisible(element));
-    const popup = dialogs.find((element) => /이용안내/.test(clean(element.innerText || element.textContent)))
-        || dialogs[0];
-    if (!popup) {
-        return { found: false };
-    }
-    const controls = Array.from(popup.querySelectorAll(
-        'button, a, input[type="button"], input[type="submit"], [role="button"]'
-    )).filter(isUsable);
-    const hasNegativeChoice = controls.some((element) => /^(취소|아니오)$/.test(labelFor(element)));
-    if (hasNegativeChoice) {
-        return { found: false };
-    }
-    const control = controls.find((element) => element.matches('button.btn_pop-close'))
-        || controls.find((element) => /^(확인|닫기|알겠습니다|예)$/.test(labelFor(element)));
-    if (!control) {
-        return { found: false };
-    }
-    if (%1) {
-        const eventOptions = { bubbles: true, cancelable: true, view: window };
-        control.focus({ preventScroll: true });
-        try { control.dispatchEvent(new PointerEvent('pointerdown', eventOptions)); } catch (_) {}
-        control.dispatchEvent(new MouseEvent('mousedown', eventOptions));
-        control.dispatchEvent(new MouseEvent('mouseup', eventOptions));
-        control.click();
-        return { found: true, clicked: true };
-    }
-    control.scrollIntoView({ block: 'center', inline: 'center' });
-    const rect = control.getBoundingClientRect();
-    return { found: rect.width > 0 && rect.height > 0,
-             x: rect.left + rect.width / 2,
-             y: rect.top + rect.height / 2 };
-})()
-)JS")
-                                   .arg(m_autoBookingDialogClicks > 0
-                                            && !m_autoBookingDialogDomFallbackUsed
-                                        ? QStringLiteral("true")
-                                        : QStringLiteral("false"));
-
-    const int commandId = sendRecorderCommand(QStringLiteral("Runtime.evaluate"),
-                                              {{QStringLiteral("expression"), expression},
-                                               {QStringLiteral("returnByValue"), true},
-                                               {QStringLiteral("awaitPromise"), true},
-                                               {QStringLiteral("userGesture"), true}},
-                                              sessionId);
-    if (commandId == 0) {
-        m_autoBookingInProgress = false;
-        m_autoBookingSeatType.clear();
-        m_autoBookingClickX = 0.0;
-        m_autoBookingClickY = 0.0;
-        m_autoBookingConfirmationAttempts = 0;
-        m_autoBookingDialogAttempts = 0;
-        m_autoBookingDialogClicks = 0;
-        m_autoBookingDialogDomFallbackUsed = false;
-        m_autoBookingWaitingForSelectionNotice = false;
-        stopTrainRefreshMacro();
-        showStatus(tr("안내 메시지를 확인할 수 없습니다."), true);
-        return;
-    }
-    m_recorderRequests.insert(commandId,
-                              {RecorderRequestType::AutoBookingDismissDialog, {}, {}, sessionId, false});
-}
-
-void MainWindow::saveDomSnapshot(const RecorderRequest &request, const QJsonObject &result)
-{
-    if (m_recorderSessions.contains(request.sessionId)) {
-        m_recorderSessions[request.sessionId].captureInFlight = false;
-    }
-
-    bool isTicketReservationPage = false;
-    const QJsonArray trains = trainInfoFromDomSnapshot(result, &isTicketReservationPage);
-    if (isTicketReservationPage) {
-        m_trainInfoSessionId = request.sessionId;
-        updateTrainInfoTable(trains);
-    } else if (request.sessionId == m_trainInfoSessionId) {
-        clearTrainInfoTable();
-    }
-
-    if (!request.saveSnapshot) {
-        if (isTicketReservationPage) {
-            updateSelectedTrainRefresh();
-        }
-        return;
-    }
-
-    const QJsonObject redactedSnapshot = redactDomSnapshot(result);
-
-    const QJsonObject document {
-        {QStringLiteral("schemaVersion"), 1},
-        {QStringLiteral("captureId"), request.captureId},
-        {QStringLiteral("capturedAt"), QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)},
-        {QStringLiteral("domSnapshot"), redactedSnapshot}
-    };
-    const QString filePath = QDir(request.captureDirectory).filePath(QStringLiteral("dom-snapshot.json"));
-    if (!writeJsonFile(filePath, document)) {
-        showStatus(tr("DOM 스냅샷을 저장하지 못했습니다."), true);
-        return;
-    }
-
-    const RecorderSession session = m_recorderSessions.value(request.sessionId);
-    appendSnapshotManifest(QFileInfo(request.captureDirectory).dir().absolutePath(),
-                           {{QStringLiteral("schemaVersion"), 1},
-                            {QStringLiteral("captureId"), request.captureId},
-                            {QStringLiteral("capturedAt"), document.value(QStringLiteral("capturedAt"))},
-                            {QStringLiteral("url"), session.url},
-                            {QStringLiteral("title"), session.title},
-                            {QStringLiteral("domSnapshotFile"),
-                             QDir(request.captureId).filePath(QStringLiteral("dom-snapshot.json"))}});
-    showStatus(tr("DOM 스냅샷을 저장했습니다: %1").arg(session.title));
-    if (isTicketReservationPage) {
-        updateSelectedTrainRefresh();
-    }
-}
-
-bool MainWindow::writeJsonFile(const QString &filePath, const QJsonObject &document) const
-{
-    if (!QDir().mkpath(QFileInfo(filePath).absolutePath())) {
-        return false;
-    }
-
-    QSaveFile file(filePath);
-    if (!file.open(QIODevice::WriteOnly)
-        || file.write(QJsonDocument(document).toJson(QJsonDocument::Indented)) < 0) {
-        return false;
-    }
-    return file.commit();
-}
-
-void MainWindow::appendSnapshotManifest(const QString &directory, const QJsonObject &entry) const
-{
-    QFile file(QDir(directory).filePath(QStringLiteral("manifest.jsonl")));
-    if (!file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
-        return;
-    }
-    file.write(QJsonDocument(entry).toJson(QJsonDocument::Compact));
-    file.write("\n");
-}
-
-QJsonObject MainWindow::redactDomSnapshot(QJsonObject snapshot)
-{
-    QJsonArray strings = snapshot.value(QStringLiteral("strings")).toArray();
-    const auto redactStringAt = [&strings](int index) {
-        if (index >= 0 && index < strings.size()) {
-            strings[index] = QStringLiteral("[REDACTED]");
-        }
-    };
-    const auto stringAt = [&strings](int index) {
-        return index >= 0 && index < strings.size() ? strings.at(index).toString() : QString();
-    };
-
-    QJsonArray documents = snapshot.value(QStringLiteral("documents")).toArray();
-    for (int documentIndex = 0; documentIndex < documents.size(); ++documentIndex) {
-        QJsonObject document = documents.at(documentIndex).toObject();
-        QJsonObject nodes = document.value(QStringLiteral("nodes")).toObject();
-
-        const auto removeInputValues = [&nodes, &redactStringAt](const QString &field) {
-            if (!nodes.contains(field)) {
-                return;
-            }
-            const QJsonArray values = nodes.value(field).toObject()
-                                          .value(QStringLiteral("value"))
-                                          .toArray();
-            for (const QJsonValue &value : values) {
-                redactStringAt(value.toInt(-1));
-            }
-            nodes.remove(field);
-        };
-        removeInputValues(QStringLiteral("inputValue"));
-        removeInputValues(QStringLiteral("textValue"));
-
-        const QJsonArray nodeNames = nodes.value(QStringLiteral("nodeName")).toArray();
-        QJsonArray attributes = nodes.value(QStringLiteral("attributes")).toArray();
-        for (int nodeIndex = 0; nodeIndex < attributes.size(); ++nodeIndex) {
-            if (nodeIndex >= nodeNames.size()) {
-                continue;
-            }
-            const int nodeNameIndex = nodeNames.at(nodeIndex).toInt(-1);
-            const QString nodeName = stringAt(nodeNameIndex).toLower();
-            if (nodeName != QStringLiteral("input")) {
-                continue;
-            }
-
-            QJsonArray attributeIndexes = attributes.at(nodeIndex).toArray();
-            for (int attributeIndex = 0;
-                 attributeIndex + 1 < attributeIndexes.size();
-                 attributeIndex += 2) {
-                const QString attributeName = stringAt(attributeIndexes.at(attributeIndex).toInt(-1))
-                                                  .toLower();
-                if (attributeName == QStringLiteral("value")) {
-                    redactStringAt(attributeIndexes.at(attributeIndex + 1).toInt(-1));
-                }
-            }
-        }
-
-        document.insert(QStringLiteral("nodes"), nodes);
-        documents[documentIndex] = document;
-    }
-
-    snapshot.insert(QStringLiteral("strings"), strings);
-    snapshot.insert(QStringLiteral("documents"), documents);
-    return snapshot;
-}
-
-QString MainWindow::defaultSnapshotDirectory()
-{
-    QString baseDirectory = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
-    if (baseDirectory.isEmpty()) {
-        baseDirectory = QDir::tempPath();
-    }
-    return QDir(baseDirectory).filePath(QStringLiteral("page-captures"));
-}
-
-bool MainWindow::isRecordablePageUrl(const QString &url)
-{
-    const QString scheme = QUrl(url).scheme().toLower();
-    return scheme != QStringLiteral("devtools")
-           && scheme != QStringLiteral("chrome")
-           && scheme != QStringLiteral("edge");
+    ui->pageRecordingButton->setEnabled(true);
+    ui->pageRecordingButton->setText(active ? tr("방문 페이지 기록 중지") : tr("방문 페이지 기록 시작"));
 }
 
 void MainWindow::setBusy(bool busy)
@@ -2300,40 +327,6 @@ void MainWindow::setBusy(bool busy)
 void MainWindow::showStatus(const QString &message, bool isError)
 {
     ui->statusLabel->setText(message);
-    ui->statusLabel->setStyleSheet(isError
-                                       ? QStringLiteral("color: #b00020;")
-                                       : QStringLiteral("color: #1b5e20;"));
-}
-
-QUrl MainWindow::debuggerVersionUrl(QString *errorMessage) const
-{
-    QString endpointText = ui->debuggerEndpointEdit->text().trimmed();
-    if (!endpointText.contains(QStringLiteral("://"))) {
-        endpointText.prepend(QStringLiteral("http://"));
-    }
-
-    QUrl versionUrl(endpointText);
-    if (!versionUrl.isValid() || versionUrl.host().isEmpty()
-        || (versionUrl.scheme() != QStringLiteral("http")
-            && versionUrl.scheme() != QStringLiteral("https"))) {
-        if (errorMessage) {
-            *errorMessage = tr("유효한 HTTP(S) CDP 디버거 주소를 입력하세요.");
-        }
-        return {};
-    }
-
-    if (versionUrl.port() == -1) {
-        versionUrl.setPort(9222);
-    }
-    versionUrl.setPath(QStringLiteral("/json/version"));
-    versionUrl.setQuery({});
-    return versionUrl;
-}
-
-bool MainWindow::isLocalCdpHost(const QString &host)
-{
-    const QString normalizedHost = host.toLower();
-    return normalizedHost == QStringLiteral("127.0.0.1")
-           || normalizedHost == QStringLiteral("localhost")
-           || normalizedHost == QStringLiteral("::1");
+    ui->statusLabel->setStyleSheet(isError ? QStringLiteral("color: #b00020;")
+                                      : QStringLiteral("color: #1b5e20;"));
 }

@@ -8,10 +8,23 @@ CONFIG += c++17
 
 SOURCES += \
     main.cpp \
-    mainwindow.cpp
+    mainwindow.cpp \
+    cdp/cdpclient.cpp \
+    korail/autobookingcontroller.cpp \
+    korail/korailauthcontroller.cpp \
+    korail/traininfoparser.cpp \
+    recorder/pagerecorder.cpp \
+    recorder/snapshotstorage.cpp
 
 HEADERS += \
-    mainwindow.h
+    mainwindow.h \
+    cdp/cdpclient.h \
+    korail/autobookingcontroller.h \
+    korail/korailauthcontroller.h \
+    korail/traininfo.h \
+    korail/traininfoparser.h \
+    recorder/pagerecorder.h \
+    recorder/snapshotstorage.h
 
 FORMS += \
     mainwindow.ui

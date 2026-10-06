@@ -55,7 +55,7 @@
        <item row="1" column="1">
         <widget class="QLineEdit" name="korailPasswordEdit">
          <property name="echoMode">
-          <enum>QLineEdit::Password</enum>
+          <enum>QLineEdit::EchoMode::Password</enum>
          </property>
          <property name="placeholderText">
           <string>코레일 비밀번호</string>
@@ -126,8 +126,11 @@
          </property>
         </widget>
        </item>
-        <item>
-         <widget class="QSpinBox" name="macroRefreshIntervalSpinBox">
+       <item>
+        <widget class="QSpinBox" name="macroRefreshIntervalSpinBox">
+         <property name="suffix">
+          <string>초</string>
+         </property>
          <property name="minimum">
           <number>1</number>
          </property>
@@ -135,28 +138,25 @@
           <number>3600</number>
          </property>
          <property name="value">
-          <number>5</number>
+          <number>1</number>
          </property>
-         <property name="suffix">
-          <string>초</string>
-         </property>
-         </widget>
-        </item>
-        <item>
-         <widget class="QCheckBox" name="autoBookWhenAvailableCheckBox">
+        </widget>
+       </item>
+       <item>
+        <widget class="QCheckBox" name="autoBookWhenAvailableCheckBox">
          <property name="toolTip">
-           <string>선택 열차에서 예매 가능한 좌석을 찾으면 예매 버튼을 자동으로 누릅니다.</string>
-          </property>
-          <property name="checked">
-           <bool>true</bool>
-          </property>
-          <property name="text">
-           <string>가능 시 자동 예매</string>
-          </property>
-         </widget>
-        </item>
-        <item>
-         <widget class="QPushButton" name="startTrainRefreshMacroButton">
+          <string>선택 열차에서 예매 가능한 좌석을 찾으면 예매 버튼을 자동으로 누릅니다.</string>
+         </property>
+         <property name="text">
+          <string>가능 시 자동 예매</string>
+         </property>
+         <property name="checked">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="startTrainRefreshMacroButton">
          <property name="text">
           <string>매크로 시작</string>
          </property>
@@ -175,7 +175,7 @@
        <item>
         <spacer name="trainRefreshMacroSpacer">
          <property name="orientation">
-          <enum>Qt::Horizontal</enum>
+          <enum>Qt::Orientation::Horizontal</enum>
          </property>
          <property name="sizeHint" stdset="0">
           <size>
@@ -195,12 +195,12 @@
       </property>
       <layout class="QVBoxLayout" name="trainInfoLayout">
        <item>
-       <widget class="QTableWidget" name="trainInfoTableWidget">
+        <widget class="QTableWidget" name="trainInfoTableWidget">
          <property name="alternatingRowColors">
           <bool>true</bool>
          </property>
          <property name="selectionMode">
-          <enum>QAbstractItemView::SingleSelection</enum>
+          <enum>QAbstractItemView::SelectionMode::SingleSelection</enum>
          </property>
         </widget>
        </item>
@@ -276,7 +276,7 @@
     <item>
      <spacer name="verticalSpacer">
       <property name="orientation">
-       <enum>Qt::Vertical</enum>
+       <enum>Qt::Orientation::Vertical</enum>
       </property>
       <property name="sizeHint" stdset="0">
        <size>
@@ -293,7 +293,7 @@
     <rect>
      <x>0</x>
      <y>0</y>
-     <width>800</width>
+     <width>980</width>
      <height>21</height>
     </rect>
    </property>

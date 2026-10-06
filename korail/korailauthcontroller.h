@@ -30,7 +30,16 @@ private:
         EnablingPage,
         Navigating,
         WaitingForLoginForm,
-        SubmittingLogin,
+        FocusingMemberNumber,
+        EnteringMemberNumber,
+        FocusingPassword,
+        EnteringPassword,
+        LocatingLoginButton,
+        PressingLoginButton,
+        ReleasingLoginButton,
+        DismissingTransientError,
+        ClosingTransientError,
+        WaitingForTransientErrorDismissal,
         CheckingLogin
     };
 
@@ -39,6 +48,9 @@ private:
     void onCommandError(int id, const QString &message);
     void waitForLoginForm();
     void submitLogin();
+    void focusPasswordField();
+    void pressLoginButton();
+    void waitForTransientErrorDismissal();
     void checkLoginResult();
     void finish(const QString &message, bool failed);
     int sendCommand(const QString &method, const QJsonObject &parameters = {});
@@ -48,10 +60,16 @@ private:
     int m_pendingCommandId = 0;
     int m_formCheckAttempts = 0;
     int m_resultCheckAttempts = 0;
+    int m_transientErrorRetryCount = 0;
+    int m_dismissCheckAttempts = 0;
     bool m_inProgress = false;
     QString m_sessionId;
     QString m_memberNumber;
     QString m_password;
+    double m_loginButtonX = 0.0;
+    double m_loginButtonY = 0.0;
+    double m_dialogButtonX = 0.0;
+    double m_dialogButtonY = 0.0;
 };
 
 #endif // KORAILAUTHCONTROLLER_H

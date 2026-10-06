@@ -2,7 +2,6 @@
 
 #include "../cdp/cdpclient.h"
 
-#include <QJsonDocument>
 #include <QTimer>
 
 KorailAuthController::KorailAuthController(CdpClient *cdpClient, QObject *parent)
@@ -36,7 +35,13 @@ void KorailAuthController::login(const QString &id, const QString &password, con
     m_pendingCommandId = 0;
     m_formCheckAttempts = 0;
     m_resultCheckAttempts = 0;
+    m_transientErrorRetryCount = 0;
+    m_dismissCheckAttempts = 0;
     m_sessionId.clear();
+    m_loginButtonX = 0.0;
+    m_loginButtonY = 0.0;
+    m_dialogButtonX = 0.0;
+    m_dialogButtonY = 0.0;
     emit loginStarted();
     emit statusChanged(tr("코레일 로그인용 Chrome 탭에 연결하는 중입니다..."));
     m_cdpClient->connectToChrome(versionUrl);
@@ -55,7 +60,7 @@ void KorailAuthController::onConnected()
     }
     m_step = LoginStep::CreatingTarget;
     sendCommand(QStringLiteral("Target.createTarget"),
-                {{QStringLiteral("url"), QStringLiteral("https://www.korail.com/ticket/login")}});
+                {{QStringLiteral("url"), QStringLiteral("about:blank")}});
 }
 
 void KorailAuthController::onCommandResult(int id, const QJsonObject &result)
@@ -112,13 +117,112 @@ void KorailAuthController::onCommandResult(int id, const QJsonObject &result)
         QTimer::singleShot(200, this, &KorailAuthController::waitForLoginForm);
         return;
     }
-    case LoginStep::SubmittingLogin:
+    case LoginStep::FocusingMemberNumber:
+        if (!result.value(QStringLiteral("result")).toObject()
+                 .value(QStringLiteral("value")).toBool()) {
+            finish(tr("코레일 회원번호 입력란에 포커스를 둘 수 없습니다."), true);
+            return;
+        }
+        m_step = LoginStep::EnteringMemberNumber;
+        sendCommand(QStringLiteral("Input.insertText"),
+                    {{QStringLiteral("text"), m_memberNumber}});
+        return;
+    case LoginStep::EnteringMemberNumber:
+        focusPasswordField();
+        return;
+    case LoginStep::FocusingPassword:
+        if (!result.value(QStringLiteral("result")).toObject()
+                 .value(QStringLiteral("value")).toBool()) {
+            finish(tr("코레일 비밀번호 입력란에 포커스를 둘 수 없습니다."), true);
+            return;
+        }
+        m_step = LoginStep::EnteringPassword;
+        sendCommand(QStringLiteral("Input.insertText"),
+                    {{QStringLiteral("text"), m_password}});
+        return;
+    case LoginStep::EnteringPassword:
+        m_step = LoginStep::LocatingLoginButton;
+        sendCommand(QStringLiteral("Runtime.evaluate"),
+                    {{QStringLiteral("expression"),
+                      QStringLiteral("(() => { const button = document.querySelector('#tab_memNum .btn_bn-depblue'); if (!button) return null; const rect = button.getBoundingClientRect(); return { x: rect.left + (rect.width / 2), y: rect.top + (rect.height / 2) }; })()")},
+                     {QStringLiteral("returnByValue"), true}});
+        return;
+    case LoginStep::LocatingLoginButton: {
+        const QJsonObject value = result.value(QStringLiteral("result")).toObject()
+                                      .value(QStringLiteral("value")).toObject();
+        if (!value.value(QStringLiteral("x")).isDouble()
+            || !value.value(QStringLiteral("y")).isDouble()) {
+            finish(tr("코레일 로그인 버튼의 위치를 확인하지 못했습니다."), true);
+            return;
+        }
+        m_loginButtonX = value.value(QStringLiteral("x")).toDouble();
+        m_loginButtonY = value.value(QStringLiteral("y")).toDouble();
+        pressLoginButton();
+        return;
+    }
+    case LoginStep::PressingLoginButton:
+        m_step = LoginStep::ReleasingLoginButton;
+        sendCommand(QStringLiteral("Input.dispatchMouseEvent"),
+                    {{QStringLiteral("type"), QStringLiteral("mouseReleased")},
+                     {QStringLiteral("x"), m_loginButtonX},
+                     {QStringLiteral("y"), m_loginButtonY},
+                     {QStringLiteral("button"), QStringLiteral("left")},
+                     {QStringLiteral("clickCount"), 1}});
+        return;
+    case LoginStep::ReleasingLoginButton:
         m_resultCheckAttempts = 0;
         QTimer::singleShot(500, this, &KorailAuthController::checkLoginResult);
         return;
+    case LoginStep::DismissingTransientError:
+        m_step = LoginStep::ClosingTransientError;
+        sendCommand(QStringLiteral("Input.dispatchMouseEvent"),
+                    {{QStringLiteral("type"), QStringLiteral("mouseReleased")},
+                     {QStringLiteral("x"), m_dialogButtonX},
+                     {QStringLiteral("y"), m_dialogButtonY},
+                     {QStringLiteral("button"), QStringLiteral("left")},
+                     {QStringLiteral("clickCount"), 1}});
+        return;
+    case LoginStep::ClosingTransientError:
+        m_dismissCheckAttempts = 0;
+        QTimer::singleShot(100, this, &KorailAuthController::waitForTransientErrorDismissal);
+        return;
+    case LoginStep::WaitingForTransientErrorDismissal: {
+        const bool stillOpen = result.value(QStringLiteral("result")).toObject()
+                                   .value(QStringLiteral("value")).toBool();
+        if (!stillOpen) {
+            pressLoginButton();
+            return;
+        }
+        if (++m_dismissCheckAttempts >= 10) {
+            finish(tr("코레일 통신 오류 안내를 닫지 못했습니다. 열린 Chrome 탭을 확인하세요."), true);
+            return;
+        }
+        QTimer::singleShot(100, this, &KorailAuthController::waitForTransientErrorDismissal);
+        return;
+    }
     case LoginStep::CheckingLogin: {
         const QJsonObject value = result.value(QStringLiteral("result")).toObject()
                                       .value(QStringLiteral("value")).toObject();
+        if (value.value(QStringLiteral("transientError")).toBool()) {
+            if (m_transientErrorRetryCount >= 1
+                || !value.value(QStringLiteral("confirmX")).isDouble()
+                || !value.value(QStringLiteral("confirmY")).isDouble()) {
+                finish(tr("코레일 로그인 요청이 통신 오류로 다시 실패했습니다. 열린 Chrome 탭을 확인하세요."), true);
+                return;
+            }
+            ++m_transientErrorRetryCount;
+            m_dialogButtonX = value.value(QStringLiteral("confirmX")).toDouble();
+            m_dialogButtonY = value.value(QStringLiteral("confirmY")).toDouble();
+            emit statusChanged(tr("코레일 통신 오류 안내를 닫고 로그인 요청을 한 번 재시도합니다..."));
+            m_step = LoginStep::DismissingTransientError;
+            sendCommand(QStringLiteral("Input.dispatchMouseEvent"),
+                        {{QStringLiteral("type"), QStringLiteral("mousePressed")},
+                         {QStringLiteral("x"), m_dialogButtonX},
+                         {QStringLiteral("y"), m_dialogButtonY},
+                         {QStringLiteral("button"), QStringLiteral("left")},
+                         {QStringLiteral("clickCount"), 1}});
+            return;
+        }
         if (value.value(QStringLiteral("loggedIn")).toBool()
             || !value.value(QStringLiteral("loginFormPresent")).toBool()) {
             finish(tr("코레일 로그인 완료를 감지했습니다."), false);
@@ -151,7 +255,7 @@ void KorailAuthController::waitForLoginForm()
     m_step = LoginStep::WaitingForLoginForm;
     sendCommand(QStringLiteral("Runtime.evaluate"),
                 {{QStringLiteral("expression"),
-                  QStringLiteral("Boolean(document.querySelector('#id') && document.querySelector('#password') && document.querySelector('#tab_memNum .btn_bn-depblue'))")},
+                  QStringLiteral("(() => { const button = document.querySelector('#tab_memNum .btn_bn-depblue'); if (!document.querySelector('#id') || !document.querySelector('#password') || !button || button.disabled || document.readyState === 'loading') return false; const rect = button.getBoundingClientRect(); const style = getComputedStyle(button); return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none'; })()")},
                  {QStringLiteral("returnByValue"), true}});
 }
 
@@ -160,33 +264,69 @@ void KorailAuthController::submitLogin()
     if (!m_inProgress) {
         return;
     }
-    const QJsonObject credentials {{QStringLiteral("memberNumber"), m_memberNumber},
-                                  {QStringLiteral("password"), m_password}};
     const QString expression = QStringLiteral(R"JS(
 (() => {
-    const credentials = %1;
-    const setValue = (element, value) => {
-        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-        setter.call(element, value);
-        element.dispatchEvent(new Event('input', { bubbles: true }));
-        element.dispatchEvent(new Event('change', { bubbles: true }));
-    };
-    const memberNumberInput = document.querySelector('#id');
-    const passwordInput = document.querySelector('#password');
-    const loginButton = document.querySelector('#tab_memNum .btn_bn-depblue');
-    if (!memberNumberInput || !passwordInput || !loginButton) {
-        throw new Error('Korail login controls are unavailable.');
+    const input = document.querySelector('#id');
+    if (!input) {
+        throw new Error('Korail member-number input is unavailable.');
     }
-    setValue(memberNumberInput, credentials.memberNumber);
-    setValue(passwordInput, credentials.password);
-    loginButton.click();
-    return true;
+    input.focus();
+    input.select();
+    return document.activeElement === input;
 })()
-)JS").arg(QString::fromUtf8(QJsonDocument(credentials).toJson(QJsonDocument::Compact)));
-    m_step = LoginStep::SubmittingLogin;
+)JS");
+    m_step = LoginStep::FocusingMemberNumber;
     sendCommand(QStringLiteral("Runtime.evaluate"),
                 {{QStringLiteral("expression"), expression}, {QStringLiteral("awaitPromise"), true},
                  {QStringLiteral("returnByValue"), true}, {QStringLiteral("userGesture"), true}});
+}
+
+void KorailAuthController::focusPasswordField()
+{
+    if (!m_inProgress || m_sessionId.isEmpty()) {
+        return;
+    }
+    const QString expression = QStringLiteral(R"JS(
+(() => {
+    const input = document.querySelector('#password');
+    if (!input) {
+        throw new Error('Korail password input is unavailable.');
+    }
+    input.focus();
+    input.select();
+    return document.activeElement === input;
+})()
+)JS");
+    m_step = LoginStep::FocusingPassword;
+    sendCommand(QStringLiteral("Runtime.evaluate"),
+                {{QStringLiteral("expression"), expression}, {QStringLiteral("awaitPromise"), true},
+                 {QStringLiteral("returnByValue"), true}, {QStringLiteral("userGesture"), true}});
+}
+
+void KorailAuthController::pressLoginButton()
+{
+    if (!m_inProgress || m_sessionId.isEmpty()) {
+        return;
+    }
+    m_step = LoginStep::PressingLoginButton;
+    sendCommand(QStringLiteral("Input.dispatchMouseEvent"),
+                {{QStringLiteral("type"), QStringLiteral("mousePressed")},
+                 {QStringLiteral("x"), m_loginButtonX},
+                 {QStringLiteral("y"), m_loginButtonY},
+                 {QStringLiteral("button"), QStringLiteral("left")},
+                 {QStringLiteral("clickCount"), 1}});
+}
+
+void KorailAuthController::waitForTransientErrorDismissal()
+{
+    if (!m_inProgress || m_sessionId.isEmpty()) {
+        return;
+    }
+    m_step = LoginStep::WaitingForTransientErrorDismissal;
+    sendCommand(QStringLiteral("Runtime.evaluate"),
+                {{QStringLiteral("expression"),
+                  QStringLiteral("Boolean(document.body && document.body.innerText.includes('통신 중 에러가 발생하였습니다'))")},
+                 {QStringLiteral("returnByValue"), true}});
 }
 
 void KorailAuthController::checkLoginResult()
@@ -197,7 +337,7 @@ void KorailAuthController::checkLoginResult()
     m_step = LoginStep::CheckingLogin;
     sendCommand(QStringLiteral("Runtime.evaluate"),
                 {{QStringLiteral("expression"),
-                  QStringLiteral("(() => ({ loginFormPresent: Boolean(document.querySelector('#id') && document.querySelector('#password')), loggedIn: Array.from(document.querySelectorAll('a, button')).some((element) => (element.textContent || '').trim() === '로그아웃') }))()")},
+                  QStringLiteral("(() => { const transientMessage = '통신 중 에러가 발생하였습니다'; const transientError = Boolean(document.body && document.body.innerText.includes(transientMessage)); const controls = Array.from(document.querySelectorAll('button, [role=button], input[type=button], input[type=submit]')); const confirm = transientError ? controls.find((element) => { const rect = element.getBoundingClientRect(); const style = getComputedStyle(element); const label = (element.textContent || element.value || '').trim(); return label === '확인' && rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none'; }) : null; const rect = confirm && confirm.getBoundingClientRect(); return { loginFormPresent: Boolean(document.querySelector('#id') && document.querySelector('#password')), loggedIn: Array.from(document.querySelectorAll('a, button')).some((element) => (element.textContent || '').trim() === '로그아웃'), transientError, confirmX: rect ? rect.left + (rect.width / 2) : null, confirmY: rect ? rect.top + (rect.height / 2) : null }; })()")},
                  {QStringLiteral("returnByValue"), true}});
 }
 

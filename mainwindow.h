@@ -42,7 +42,16 @@ private:
 
     enum class RecorderRequestType {
         TargetList,
-        DomSnapshot
+        DomSnapshot,
+        AutoBooking,
+        AutoBookingMousePressed,
+        AutoBookingMouseReleased,
+        AutoBookingConfirm,
+        AutoBookingConfirmMousePressed,
+        AutoBookingConfirmMouseReleased,
+        AutoBookingDismissDialog,
+        AutoBookingDismissDialogMousePressed,
+        AutoBookingDismissDialogMouseReleased
     };
 
     struct RecorderSession {
@@ -74,6 +83,7 @@ private:
     void checkKorailLoginResult();
     void finishKorailLogin(const QString &message, bool isError = false);
     void togglePageRecording();
+    void openSnapshotDirectory();
     void startPageRecording();
     void stopPageRecording(const QString &message = QString());
     void startTrainInfoMonitoring();
@@ -99,6 +109,10 @@ private:
     void updateSelectedTrainRefresh();
     void refreshSelectedTrainPage();
     bool hasReservableSelectedTrain() const;
+    QJsonObject reservableSelectedTrain() const;
+    void startAutoBookingForReservableTrain();
+    void continueAutoBookingWithConfirmation(const QString &sessionId);
+    void continueAutoBookingWithInformationalDialogs(const QString &sessionId);
     bool writeJsonFile(const QString &filePath, const QJsonObject &document) const;
     void appendSnapshotManifest(const QString &directory, const QJsonObject &entry) const;
     static QJsonObject redactDomSnapshot(QJsonObject snapshot);
@@ -136,6 +150,15 @@ private:
     QString m_trainInfoSessionId;
     QSet<QString> m_selectedTrainKeys;
     bool m_trainRefreshMacroActive = false;
+    bool m_autoBookingInProgress = false;
+    QString m_autoBookingSeatType;
+    double m_autoBookingClickX = 0.0;
+    double m_autoBookingClickY = 0.0;
+    int m_autoBookingConfirmationAttempts = 0;
+    int m_autoBookingDialogAttempts = 0;
+    int m_autoBookingDialogClicks = 0;
+    bool m_autoBookingDialogDomFallbackUsed = false;
+    bool m_autoBookingWaitingForSelectionNotice = false;
     bool m_updatingTrainInfoTable = false;
 };
 #endif // MAINWINDOW_H

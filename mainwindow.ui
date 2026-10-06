@@ -93,11 +93,22 @@
         </widget>
        </item>
        <item row="1" column="1">
-        <widget class="QPushButton" name="pageRecordingButton">
-         <property name="text">
-          <string>방문 페이지 기록 시작</string>
-         </property>
-        </widget>
+        <layout class="QHBoxLayout" name="pageRecordingButtonLayout">
+         <item>
+          <widget class="QPushButton" name="pageRecordingButton">
+           <property name="text">
+            <string>방문 페이지 기록 시작</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="openSnapshotDirectoryButton">
+           <property name="text">
+            <string>저장 폴더 열기</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
        </item>
       </layout>
      </widget>
@@ -115,8 +126,8 @@
          </property>
         </widget>
        </item>
-       <item>
-        <widget class="QSpinBox" name="macroRefreshIntervalSpinBox">
+        <item>
+         <widget class="QSpinBox" name="macroRefreshIntervalSpinBox">
          <property name="minimum">
           <number>1</number>
          </property>
@@ -129,10 +140,23 @@
          <property name="suffix">
           <string>초</string>
          </property>
-        </widget>
-       </item>
-       <item>
-        <widget class="QPushButton" name="startTrainRefreshMacroButton">
+         </widget>
+        </item>
+        <item>
+         <widget class="QCheckBox" name="autoBookWhenAvailableCheckBox">
+         <property name="toolTip">
+           <string>선택 열차에서 예매 가능한 좌석을 찾으면 예매 버튼을 자동으로 누릅니다.</string>
+          </property>
+          <property name="checked">
+           <bool>true</bool>
+          </property>
+          <property name="text">
+           <string>가능 시 자동 예매</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QPushButton" name="startTrainRefreshMacroButton">
          <property name="text">
           <string>매크로 시작</string>
          </property>

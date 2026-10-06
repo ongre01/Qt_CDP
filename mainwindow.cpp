@@ -5,6 +5,8 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
+#include <QCheckBox>
+#include <QDesktopServices>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -46,11 +48,15 @@ bool isReservableSeatText(const QString &seatText)
     const QString text = normalizedText(seatText);
     const bool indicatesReservation = text.contains(QStringLiteral("예매"))
         || text.contains(QStringLiteral("예약"));
+    const bool indicatesFare = QRegularExpression(
+        QStringLiteral("\\b\\d{1,3}(?:,\\d{3})*\\s*원"))
+                                  .match(text)
+                                  .hasMatch();
     const bool indicatesUnavailability = text.contains(QStringLiteral("매진"))
         || text.contains(QStringLiteral("없음"))
         || text.contains(QStringLiteral("불가"))
         || text.contains(QStringLiteral("대기"));
-    return indicatesReservation && !indicatesUnavailability;
+    return (indicatesReservation || indicatesFare) && !indicatesUnavailability;
 }
 
 QJsonArray trainInfoFromDomSnapshot(const QJsonObject &snapshot, bool *isTicketReservationPage)
@@ -245,6 +251,8 @@ MainWindow::MainWindow(QWidget *parent)
             this, &MainWindow::startKorailAutoLogin);
     connect(ui->pageRecordingButton, &QPushButton::clicked,
             this, &MainWindow::togglePageRecording);
+    connect(ui->openSnapshotDirectoryButton, &QPushButton::clicked,
+            this, &MainWindow::openSnapshotDirectory);
     connect(ui->trainInfoTableWidget, &QTableWidget::itemChanged,
             this, &MainWindow::onTrainInfoItemChanged);
     connect(ui->startTrainRefreshMacroButton, &QPushButton::clicked,
@@ -278,6 +286,12 @@ MainWindow::MainWindow(QWidget *parent)
                 m_selectedTrainRefreshTimer.setInterval(seconds * 1000);
                 if (m_trainRefreshMacroActive && m_selectedTrainRefreshTimer.isActive()) {
                     m_selectedTrainRefreshTimer.start();
+                }
+            });
+    connect(ui->autoBookWhenAvailableCheckBox, &QCheckBox::toggled,
+            this, [this](bool enabled) {
+                if (enabled) {
+                    updateSelectedTrainRefresh();
                 }
             });
     connect(&m_cdpSocket, &QWebSocket::connected,
@@ -677,6 +691,22 @@ void MainWindow::togglePageRecording()
     startPageRecording();
 }
 
+void MainWindow::openSnapshotDirectory()
+{
+    const QString snapshotDirectory = ui->snapshotDirectoryEdit->text().trimmed();
+    if (snapshotDirectory.isEmpty()) {
+        showStatus(tr("스냅샷 저장 폴더를 입력하세요."), true);
+        return;
+    }
+    if (!QDir().mkpath(snapshotDirectory)) {
+        showStatus(tr("스냅샷 저장 폴더를 만들 수 없습니다."), true);
+        return;
+    }
+    if (!QDesktopServices::openUrl(QUrl::fromLocalFile(QDir(snapshotDirectory).absolutePath()))) {
+        showStatus(tr("스냅샷 저장 폴더를 열 수 없습니다."), true);
+    }
+}
+
 void MainWindow::startPageRecording()
 {
     const QString snapshotDirectory = ui->snapshotDirectoryEdit->text().trimmed();
@@ -868,6 +898,28 @@ void MainWindow::onRecorderTextMessageReceived(const QString &message)
             && m_recorderSessions.contains(request.sessionId)) {
             m_recorderSessions[request.sessionId].captureInFlight = false;
         }
+        const bool isAutoBookingRequest = request.type == RecorderRequestType::AutoBooking
+                                          || request.type == RecorderRequestType::AutoBookingMousePressed
+                                          || request.type == RecorderRequestType::AutoBookingMouseReleased
+                                          || request.type == RecorderRequestType::AutoBookingConfirm
+                                          || request.type == RecorderRequestType::AutoBookingConfirmMousePressed
+                                          || request.type == RecorderRequestType::AutoBookingConfirmMouseReleased
+                                          || request.type == RecorderRequestType::AutoBookingDismissDialog
+                                          || request.type == RecorderRequestType::AutoBookingDismissDialogMousePressed
+                                          || request.type == RecorderRequestType::AutoBookingDismissDialogMouseReleased;
+        if (isAutoBookingRequest) {
+            m_autoBookingInProgress = false;
+            m_autoBookingSeatType.clear();
+            m_autoBookingClickX = 0.0;
+            m_autoBookingClickY = 0.0;
+            m_autoBookingConfirmationAttempts = 0;
+            m_autoBookingDialogAttempts = 0;
+            m_autoBookingDialogClicks = 0;
+            m_autoBookingDialogDomFallbackUsed = false;
+            m_autoBookingWaitingForSelectionNotice = false;
+            stopTrainRefreshMacro();
+            showStatus(tr("자동 예매 명령을 실행하지 못했습니다."), true);
+        }
         return;
     }
 
@@ -892,6 +944,292 @@ void MainWindow::onRecorderTextMessageReceived(const QString &message)
     case RecorderRequestType::DomSnapshot:
         saveDomSnapshot(request, result);
         return;
+    case RecorderRequestType::AutoBooking: {
+        const QJsonObject value = result.value(QStringLiteral("result"))
+                                      .toObject()
+                                      .value(QStringLiteral("value"))
+                                      .toObject();
+        if (!value.value(QStringLiteral("found")).toBool()
+            || !value.value(QStringLiteral("x")).isDouble()
+            || !value.value(QStringLiteral("y")).isDouble()) {
+            m_autoBookingInProgress = false;
+            m_autoBookingClickX = 0.0;
+            m_autoBookingClickY = 0.0;
+            stopTrainRefreshMacro();
+            showStatus(tr("자동 예매를 시작하지 못했습니다: %1")
+                           .arg(value.value(QStringLiteral("message"))
+                                    .toString(tr("예매 버튼을 찾지 못했습니다."))),
+                       true);
+            return;
+        }
+
+        m_autoBookingSeatType = value.value(QStringLiteral("seatType"))
+                                   .toString(tr("선택한 좌석"));
+        m_autoBookingClickX = value.value(QStringLiteral("x")).toDouble();
+        m_autoBookingClickY = value.value(QStringLiteral("y")).toDouble();
+        const int commandId = sendRecorderCommand(
+            QStringLiteral("Input.dispatchMouseEvent"),
+            {{QStringLiteral("type"), QStringLiteral("mousePressed")},
+             {QStringLiteral("x"), m_autoBookingClickX},
+             {QStringLiteral("y"), m_autoBookingClickY},
+             {QStringLiteral("button"), QStringLiteral("left")},
+             {QStringLiteral("clickCount"), 1}},
+            request.sessionId);
+        if (commandId == 0) {
+            m_autoBookingInProgress = false;
+            m_autoBookingSeatType.clear();
+            m_autoBookingClickX = 0.0;
+            m_autoBookingClickY = 0.0;
+            stopTrainRefreshMacro();
+            showStatus(tr("자동 예매 버튼에 마우스 입력을 보낼 수 없습니다."), true);
+            return;
+        }
+        m_recorderRequests.insert(commandId,
+                                  {RecorderRequestType::AutoBookingMousePressed,
+                                   {}, {}, request.sessionId, false});
+        return;
+    }
+    case RecorderRequestType::AutoBookingMousePressed: {
+        const int commandId = sendRecorderCommand(
+            QStringLiteral("Input.dispatchMouseEvent"),
+            {{QStringLiteral("type"), QStringLiteral("mouseReleased")},
+             {QStringLiteral("x"), m_autoBookingClickX},
+             {QStringLiteral("y"), m_autoBookingClickY},
+             {QStringLiteral("button"), QStringLiteral("left")},
+             {QStringLiteral("clickCount"), 1}},
+            request.sessionId);
+        if (commandId == 0) {
+            m_autoBookingInProgress = false;
+            m_autoBookingSeatType.clear();
+            m_autoBookingClickX = 0.0;
+            m_autoBookingClickY = 0.0;
+            stopTrainRefreshMacro();
+            showStatus(tr("자동 예매 버튼에 마우스 입력을 완료하지 못했습니다."), true);
+            return;
+        }
+        m_recorderRequests.insert(commandId,
+                                  {RecorderRequestType::AutoBookingMouseReleased,
+                                   {}, {}, request.sessionId, false});
+        return;
+    }
+    case RecorderRequestType::AutoBookingMouseReleased:
+        m_autoBookingWaitingForSelectionNotice = false;
+        m_autoBookingConfirmationAttempts = 0;
+        m_autoBookingDialogAttempts = 0;
+        m_autoBookingDialogClicks = 0;
+        m_autoBookingDialogDomFallbackUsed = false;
+        showStatus(tr("%1 좌석을 선택했습니다. 하단 예매 버튼을 누르는 중입니다...")
+                       .arg(m_autoBookingSeatType.isEmpty()
+                                ? tr("선택한")
+                                : m_autoBookingSeatType));
+        QTimer::singleShot(250, this, [this, sessionId = request.sessionId]() {
+            continueAutoBookingWithConfirmation(sessionId);
+        });
+        return;
+    case RecorderRequestType::AutoBookingConfirm: {
+        const QJsonObject value = result.value(QStringLiteral("result"))
+                                      .toObject()
+                                      .value(QStringLiteral("value"))
+                                      .toObject();
+        if (!value.value(QStringLiteral("found")).toBool()
+            || !value.value(QStringLiteral("x")).isDouble()
+            || !value.value(QStringLiteral("y")).isDouble()) {
+            if (++m_autoBookingConfirmationAttempts < 10) {
+                QTimer::singleShot(250, this, [this, sessionId = request.sessionId]() {
+                    continueAutoBookingWithConfirmation(sessionId);
+                });
+                return;
+            }
+            m_autoBookingInProgress = false;
+            m_autoBookingSeatType.clear();
+            m_autoBookingClickX = 0.0;
+            m_autoBookingClickY = 0.0;
+            m_autoBookingConfirmationAttempts = 0;
+            m_autoBookingWaitingForSelectionNotice = false;
+            stopTrainRefreshMacro();
+            showStatus(tr("좌석은 선택됐지만 하단 예매 버튼을 찾지 못했습니다."), true);
+            return;
+        }
+
+        m_autoBookingClickX = value.value(QStringLiteral("x")).toDouble();
+        m_autoBookingClickY = value.value(QStringLiteral("y")).toDouble();
+        const int commandId = sendRecorderCommand(
+            QStringLiteral("Input.dispatchMouseEvent"),
+            {{QStringLiteral("type"), QStringLiteral("mousePressed")},
+             {QStringLiteral("x"), m_autoBookingClickX},
+             {QStringLiteral("y"), m_autoBookingClickY},
+             {QStringLiteral("button"), QStringLiteral("left")},
+             {QStringLiteral("clickCount"), 1}},
+            request.sessionId);
+        if (commandId == 0) {
+            m_autoBookingInProgress = false;
+            m_autoBookingSeatType.clear();
+            m_autoBookingClickX = 0.0;
+            m_autoBookingClickY = 0.0;
+            m_autoBookingConfirmationAttempts = 0;
+            m_autoBookingWaitingForSelectionNotice = false;
+            stopTrainRefreshMacro();
+            showStatus(tr("하단 예매 버튼에 마우스 입력을 보낼 수 없습니다."), true);
+            return;
+        }
+        m_recorderRequests.insert(commandId,
+                                  {RecorderRequestType::AutoBookingConfirmMousePressed,
+                                   {}, {}, request.sessionId, false});
+        return;
+    }
+    case RecorderRequestType::AutoBookingConfirmMousePressed: {
+        const int commandId = sendRecorderCommand(
+            QStringLiteral("Input.dispatchMouseEvent"),
+            {{QStringLiteral("type"), QStringLiteral("mouseReleased")},
+             {QStringLiteral("x"), m_autoBookingClickX},
+             {QStringLiteral("y"), m_autoBookingClickY},
+             {QStringLiteral("button"), QStringLiteral("left")},
+             {QStringLiteral("clickCount"), 1}},
+            request.sessionId);
+        if (commandId == 0) {
+            m_autoBookingInProgress = false;
+            m_autoBookingSeatType.clear();
+            m_autoBookingClickX = 0.0;
+            m_autoBookingClickY = 0.0;
+            m_autoBookingConfirmationAttempts = 0;
+            m_autoBookingWaitingForSelectionNotice = false;
+            stopTrainRefreshMacro();
+            showStatus(tr("하단 예매 버튼에 마우스 입력을 완료하지 못했습니다."), true);
+            return;
+        }
+        m_recorderRequests.insert(commandId,
+                                  {RecorderRequestType::AutoBookingConfirmMouseReleased,
+                                   {}, {}, request.sessionId, false});
+        return;
+    }
+    case RecorderRequestType::AutoBookingConfirmMouseReleased:
+        m_autoBookingWaitingForSelectionNotice = false;
+        m_autoBookingDialogAttempts = 0;
+        m_autoBookingDialogClicks = 0;
+        m_autoBookingDialogDomFallbackUsed = false;
+        showStatus(tr("하단 예매 버튼을 눌렀습니다. 안내 메시지를 확인하는 중입니다..."));
+        QTimer::singleShot(150, this, [this, sessionId = request.sessionId]() {
+            continueAutoBookingWithInformationalDialogs(sessionId);
+        });
+        return;
+    case RecorderRequestType::AutoBookingDismissDialog: {
+        const QJsonObject value = result.value(QStringLiteral("result"))
+                                      .toObject()
+                                      .value(QStringLiteral("value"))
+                                      .toObject();
+        if (value.value(QStringLiteral("clicked")).toBool()) {
+            ++m_autoBookingDialogClicks;
+            m_autoBookingDialogAttempts = 0;
+            m_autoBookingDialogDomFallbackUsed = true;
+            showStatus(tr("안내 메시지의 확인 버튼을 다시 눌렀습니다. 닫힘을 확인하는 중입니다..."));
+            QTimer::singleShot(250, this, [this, sessionId = request.sessionId]() {
+                continueAutoBookingWithInformationalDialogs(sessionId);
+            });
+            return;
+        }
+        if (!value.value(QStringLiteral("found")).toBool()
+            || !value.value(QStringLiteral("x")).isDouble()
+            || !value.value(QStringLiteral("y")).isDouble()) {
+            if (++m_autoBookingDialogAttempts < 12) {
+                QTimer::singleShot(250, this, [this, sessionId = request.sessionId]() {
+                    continueAutoBookingWithInformationalDialogs(sessionId);
+                });
+                return;
+            }
+
+            m_autoBookingInProgress = false;
+            m_autoBookingSeatType.clear();
+            m_autoBookingClickX = 0.0;
+            m_autoBookingClickY = 0.0;
+            m_autoBookingConfirmationAttempts = 0;
+            m_autoBookingDialogAttempts = 0;
+            m_autoBookingDialogClicks = 0;
+            m_autoBookingDialogDomFallbackUsed = false;
+            m_autoBookingWaitingForSelectionNotice = false;
+            stopTrainRefreshMacro();
+            showStatus(tr("하단 예매 버튼을 눌렀습니다. 예매 화면으로 전환되는지 확인하세요."));
+            return;
+        }
+
+        m_autoBookingClickX = value.value(QStringLiteral("x")).toDouble();
+        m_autoBookingClickY = value.value(QStringLiteral("y")).toDouble();
+        const int commandId = sendRecorderCommand(
+            QStringLiteral("Input.dispatchMouseEvent"),
+            {{QStringLiteral("type"), QStringLiteral("mousePressed")},
+             {QStringLiteral("x"), m_autoBookingClickX},
+             {QStringLiteral("y"), m_autoBookingClickY},
+             {QStringLiteral("button"), QStringLiteral("left")},
+             {QStringLiteral("clickCount"), 1}},
+            request.sessionId);
+        if (commandId == 0) {
+            m_autoBookingInProgress = false;
+            m_autoBookingSeatType.clear();
+            m_autoBookingClickX = 0.0;
+            m_autoBookingClickY = 0.0;
+            m_autoBookingConfirmationAttempts = 0;
+            m_autoBookingDialogAttempts = 0;
+            m_autoBookingDialogClicks = 0;
+            m_autoBookingDialogDomFallbackUsed = false;
+            m_autoBookingWaitingForSelectionNotice = false;
+            stopTrainRefreshMacro();
+            showStatus(tr("안내 메시지의 확인 버튼에 마우스 입력을 보낼 수 없습니다."), true);
+            return;
+        }
+        m_recorderRequests.insert(commandId,
+                                  {RecorderRequestType::AutoBookingDismissDialogMousePressed,
+                                   {}, {}, request.sessionId, false});
+        return;
+    }
+    case RecorderRequestType::AutoBookingDismissDialogMousePressed: {
+        const int commandId = sendRecorderCommand(
+            QStringLiteral("Input.dispatchMouseEvent"),
+            {{QStringLiteral("type"), QStringLiteral("mouseReleased")},
+             {QStringLiteral("x"), m_autoBookingClickX},
+             {QStringLiteral("y"), m_autoBookingClickY},
+             {QStringLiteral("button"), QStringLiteral("left")},
+             {QStringLiteral("clickCount"), 1}},
+            request.sessionId);
+        if (commandId == 0) {
+            m_autoBookingInProgress = false;
+            m_autoBookingSeatType.clear();
+            m_autoBookingClickX = 0.0;
+            m_autoBookingClickY = 0.0;
+            m_autoBookingConfirmationAttempts = 0;
+            m_autoBookingDialogAttempts = 0;
+            m_autoBookingDialogClicks = 0;
+            m_autoBookingDialogDomFallbackUsed = false;
+            m_autoBookingWaitingForSelectionNotice = false;
+            stopTrainRefreshMacro();
+            showStatus(tr("안내 메시지의 확인 버튼에 마우스 입력을 완료하지 못했습니다."), true);
+            return;
+        }
+        m_recorderRequests.insert(commandId,
+                                  {RecorderRequestType::AutoBookingDismissDialogMouseReleased,
+                                   {}, {}, request.sessionId, false});
+        return;
+    }
+    case RecorderRequestType::AutoBookingDismissDialogMouseReleased:
+        ++m_autoBookingDialogClicks;
+        m_autoBookingDialogAttempts = 0;
+        if (m_autoBookingDialogClicks >= 3) {
+            m_autoBookingInProgress = false;
+            m_autoBookingSeatType.clear();
+            m_autoBookingClickX = 0.0;
+            m_autoBookingClickY = 0.0;
+            m_autoBookingConfirmationAttempts = 0;
+            m_autoBookingDialogAttempts = 0;
+            m_autoBookingDialogClicks = 0;
+            m_autoBookingDialogDomFallbackUsed = false;
+            m_autoBookingWaitingForSelectionNotice = false;
+            stopTrainRefreshMacro();
+            showStatus(tr("안내 메시지를 확인하고 예매를 진행했습니다."));
+            return;
+        }
+        showStatus(tr("안내 메시지의 확인 버튼을 눌렀습니다. 예매 화면으로 이동하는 중입니다..."));
+        QTimer::singleShot(200, this, [this, sessionId = request.sessionId]() {
+            continueAutoBookingWithInformationalDialogs(sessionId);
+        });
+        return;
     }
 }
 
@@ -902,6 +1240,15 @@ void MainWindow::onRecorderSocketDisconnected()
     m_pageRecordingRequested = false;
     m_trainInfoMonitoringActive = false;
     m_trainInfoMonitoringRequested = false;
+    m_autoBookingInProgress = false;
+    m_autoBookingSeatType.clear();
+    m_autoBookingClickX = 0.0;
+    m_autoBookingClickY = 0.0;
+    m_autoBookingConfirmationAttempts = 0;
+    m_autoBookingDialogAttempts = 0;
+    m_autoBookingDialogClicks = 0;
+    m_autoBookingDialogDomFallbackUsed = false;
+    m_autoBookingWaitingForSelectionNotice = false;
     m_recorderRequests.clear();
     m_recorderSessions.clear();
     m_targetToRecorderSession.clear();
@@ -947,6 +1294,16 @@ void MainWindow::handleRecorderEvent(const QJsonObject &event)
 
     const QString method = event.value(QStringLiteral("method")).toString();
     const QJsonObject parameters = event.value(QStringLiteral("params")).toObject();
+    if (method == QStringLiteral("Page.javascriptDialogOpening")) {
+        const QString sessionId = event.value(QStringLiteral("sessionId")).toString();
+        const QString dialogType = parameters.value(QStringLiteral("type")).toString();
+        if (dialogType == QStringLiteral("alert") && !sessionId.isEmpty()) {
+            sendRecorderCommand(QStringLiteral("Page.handleJavaScriptDialog"),
+                                {{QStringLiteral("accept"), true}}, sessionId);
+            showStatus(tr("안내 메시지를 자동으로 확인했습니다."));
+        }
+        return;
+    }
     if (method == QStringLiteral("Target.attachedToTarget")) {
         attachRecorderToPage(parameters);
         return;
@@ -1379,12 +1736,20 @@ void MainWindow::updateSelectedTrainRefresh()
         m_selectedTrainRefreshTimer.stop();
         return;
     }
+    if (m_autoBookingInProgress) {
+        m_selectedTrainRefreshTimer.stop();
+        return;
+    }
     if (m_selectedTrainKeys.isEmpty()) {
         m_selectedTrainRefreshTimer.stop();
         showStatus(tr("매크로가 준비되었습니다. 예매 가능 여부를 확인할 열차를 선택하세요."));
         return;
     }
     if (hasReservableSelectedTrain()) {
+        if (ui->autoBookWhenAvailableCheckBox->isChecked()) {
+            startAutoBookingForReservableTrain();
+            return;
+        }
         stopTrainRefreshMacro(tr("선택한 열차에서 예매 가능한 좌석을 찾았습니다."));
         return;
     }
@@ -1402,7 +1767,11 @@ void MainWindow::updateSelectedTrainRefresh()
 void MainWindow::refreshSelectedTrainPage()
 {
     if (!m_trainRefreshMacroActive || m_selectedTrainKeys.isEmpty()
-        || hasReservableSelectedTrain()) {
+        || m_autoBookingInProgress) {
+        return;
+    }
+    if (hasReservableSelectedTrain()) {
+        updateSelectedTrainRefresh();
         return;
     }
     if (!isRecorderActive() || m_trainInfoSessionId.isEmpty()
@@ -1419,6 +1788,11 @@ void MainWindow::refreshSelectedTrainPage()
 
 bool MainWindow::hasReservableSelectedTrain() const
 {
+    return !reservableSelectedTrain().isEmpty();
+}
+
+QJsonObject MainWindow::reservableSelectedTrain() const
+{
     for (int row = 0; row < ui->trainInfoTableWidget->rowCount(); ++row) {
         const QTableWidgetItem *selectionItem = ui->trainInfoTableWidget->item(row, 0);
         if (!selectionItem || selectionItem->checkState() != Qt::Checked) {
@@ -1427,12 +1801,332 @@ bool MainWindow::hasReservableSelectedTrain() const
 
         const QTableWidgetItem *generalSeatItem = ui->trainInfoTableWidget->item(row, 8);
         const QTableWidgetItem *specialSeatItem = ui->trainInfoTableWidget->item(row, 9);
-        if ((generalSeatItem && isReservableSeatText(generalSeatItem->text()))
-            || (specialSeatItem && isReservableSeatText(specialSeatItem->text()))) {
-            return true;
+        const bool generalReservable = generalSeatItem && isReservableSeatText(generalSeatItem->text());
+        const bool specialReservable = specialSeatItem && isReservableSeatText(specialSeatItem->text());
+        if (generalReservable || specialReservable) {
+            const auto textAt = [this, row](int column) {
+                const QTableWidgetItem *item = ui->trainInfoTableWidget->item(row, column);
+                return item ? item->text() : QString();
+            };
+            return {{QStringLiteral("trainType"), textAt(1)},
+                    {QStringLiteral("trainNumber"), textAt(2)},
+                    {QStringLiteral("departure"), textAt(3)},
+                    {QStringLiteral("departureTime"), textAt(4)},
+                    {QStringLiteral("arrival"), textAt(5)},
+                    {QStringLiteral("arrivalTime"), textAt(6)},
+                    {QStringLiteral("generalReservable"), generalReservable},
+                    {QStringLiteral("specialReservable"), specialReservable}};
         }
     }
-    return false;
+    return {};
+}
+
+void MainWindow::startAutoBookingForReservableTrain()
+{
+    if (!m_trainRefreshMacroActive || m_autoBookingInProgress || !isRecorderActive()
+        || m_trainInfoSessionId.isEmpty() || !m_recorderSessions.contains(m_trainInfoSessionId)) {
+        return;
+    }
+
+    const QJsonObject train = reservableSelectedTrain();
+    if (train.isEmpty()) {
+        return;
+    }
+    if (train.value(QStringLiteral("trainNumber")).toString().isEmpty()
+        || train.value(QStringLiteral("departureTime")).toString().isEmpty()
+        || train.value(QStringLiteral("arrivalTime")).toString().isEmpty()) {
+        stopTrainRefreshMacro();
+        showStatus(tr("자동 예매에 필요한 열차 번호 또는 운행 시각을 확인하지 못했습니다."), true);
+        return;
+    }
+
+    const QString expression = QStringLiteral(R"JS(
+(() => {
+    const train = %1;
+    const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+    const rowMatches = (row) => {
+        const text = clean(row.innerText || row.textContent);
+        return [train.trainType, train.trainNumber, train.departure, train.departureTime,
+                train.arrival, train.arrivalTime]
+            .filter(Boolean)
+            .every((part) => text.includes(clean(part)));
+    };
+    const isReservable = (text) => {
+        const value = clean(text);
+        return (/예매|예약|\b\d{1,3}(?:,\d{3})*\s*원/.test(value))
+            && !/매진|없음|불가|대기/.test(value);
+    };
+    const isUsable = (element) => {
+        if (!element || element.disabled || element.getAttribute('aria-disabled') === 'true'
+            || /disabled|disable|soldout|sold-out/i.test(element.className || '')) {
+            return false;
+        }
+        const style = window.getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden'
+            && rect.width > 0 && rect.height > 0;
+    };
+    const actionSelector = 'a, button, input[type="button"], input[type="submit"], [role="button"]';
+    const actionText = (element) => clean([
+        element.innerText, element.value, element.textContent,
+        element.getAttribute('aria-label'), element.getAttribute('title')
+    ].filter(Boolean).join(' '));
+    const isReservationControl = (element) => isUsable(element) && isReservable(actionText(element));
+    const rows = Array.from(document.querySelectorAll(
+        'li.tckList, tr, [data-train-no], [data-trainno], [data-train-number]'
+    )).map((element) => element.closest('li.tckList, tr') || element);
+    const row = rows.find(rowMatches);
+    if (!row) {
+        return { found: false, message: '선택한 열차 행을 찾지 못했습니다.' };
+    }
+    const seatTypes = [
+        { name: '일반실', selector: '.gen, .general, .normal, [class*="gen"], [class*="general"]', available: train.generalReservable },
+        { name: '특실', selector: '.spe, .special, [class*="spe"], [class*="special"]', available: train.specialReservable }
+    ];
+    const rowControls = Array.from(row.querySelectorAll(actionSelector)).filter(isReservationControl);
+    const pointFor = (control, seatType) => {
+        control.scrollIntoView({ block: 'center', inline: 'center' });
+        const rect = control.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) {
+            return null;
+        }
+        return { found: true, seatType, x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+    };
+    for (const seat of seatTypes) {
+        if (!seat.available) {
+            continue;
+        }
+        for (const container of Array.from(row.querySelectorAll(seat.selector))) {
+            if (!isReservable(container.innerText || container.textContent)) {
+                continue;
+            }
+            const controls = (container.matches(actionSelector) ? [container] : [])
+                .concat(Array.from(container.querySelectorAll(actionSelector)));
+            const control = controls.find(isReservationControl);
+            const point = control ? pointFor(control, seat.name) : null;
+            if (point) {
+                return point;
+            }
+            const containerPoint = pointFor(container, seat.name);
+            if (containerPoint) {
+                return containerPoint;
+            }
+        }
+
+        const seatKeyword = seat.name === '일반실' ? /일반|general|normal|gen/i : /특실|special|spe/i;
+        const control = rowControls.find((candidate) => {
+            let current = candidate;
+            for (let depth = 0; current && current !== row && depth < 4; ++depth, current = current.parentElement) {
+                const context = clean([
+                    current.className, current.id, current.getAttribute('data-seat-class'),
+                    current.getAttribute('aria-label'), current.innerText
+                ].filter(Boolean).join(' '));
+                if (seatKeyword.test(context)) {
+                    return true;
+                }
+            }
+            return false;
+        });
+        const point = control ? pointFor(control, seat.name) : null;
+        if (point) {
+            return point;
+        }
+    }
+    if (rowControls.length === 1) {
+        return pointFor(rowControls[0], '예매 가능 좌석');
+    }
+    return { found: false, message: '예매 가능한 좌석의 예매 버튼을 찾지 못했습니다.' };
+})()
+)JS")
+                                   .arg(QString::fromUtf8(QJsonDocument(train)
+                                                              .toJson(QJsonDocument::Compact)));
+
+    m_autoBookingWaitingForSelectionNotice = false;
+    m_autoBookingConfirmationAttempts = 0;
+    m_autoBookingDialogAttempts = 0;
+    m_autoBookingDialogClicks = 0;
+    m_autoBookingDialogDomFallbackUsed = false;
+    m_autoBookingInProgress = true;
+    m_selectedTrainRefreshTimer.stop();
+    const int commandId = sendRecorderCommand(QStringLiteral("Runtime.evaluate"),
+                                              {{QStringLiteral("expression"), expression},
+                                               {QStringLiteral("returnByValue"), true},
+                                               {QStringLiteral("awaitPromise"), true},
+                                               {QStringLiteral("userGesture"), true}},
+                                              m_trainInfoSessionId);
+    if (commandId == 0) {
+        m_autoBookingInProgress = false;
+        stopTrainRefreshMacro();
+        showStatus(tr("자동 예매 명령을 보낼 수 없습니다."), true);
+        return;
+    }
+    m_recorderRequests.insert(commandId,
+                              {RecorderRequestType::AutoBooking, {}, {}, m_trainInfoSessionId, false});
+    showStatus(tr("예매 가능한 좌석을 찾아 자동 예매를 시도하는 중입니다..."));
+}
+
+void MainWindow::continueAutoBookingWithConfirmation(const QString &sessionId)
+{
+    if (!m_trainRefreshMacroActive || !m_autoBookingInProgress || sessionId.isEmpty()
+        || !isRecorderActive() || !m_recorderSessions.contains(sessionId)) {
+        return;
+    }
+
+    const QString expression = QStringLiteral(R"JS(
+(() => {
+    const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+    const textFor = (element) => clean([
+        element.innerText, element.value, element.textContent,
+        element.getAttribute('aria-label'), element.getAttribute('title')
+    ].filter(Boolean).join(' '));
+    const isUsable = (element) => {
+        if (!element || element.disabled || element.getAttribute('aria-disabled') === 'true'
+            || /disabled|disable/i.test(element.className || '')) {
+            return false;
+        }
+        const style = window.getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden'
+            && rect.width > 0 && rect.height > 0;
+    };
+    const isBookingLabel = (element) =>
+        /(^|\s)예매(?=\s|$)/.test(textFor(element)) && !/예약대기/.test(textFor(element));
+    const bottomReservationButtons = Array.from(document.querySelectorAll(
+        '.ticket_reserv_wrap button.reservbtn:not([disabled]), '
+        + '.ticket_reserv_wrap button.btn_bn-blue02:not([disabled])'
+    )).filter((element) => isUsable(element) && isBookingLabel(element));
+    const controls = bottomReservationButtons.length > 0
+        ? bottomReservationButtons
+        : Array.from(document.querySelectorAll('body *'))
+              .filter((element) => isUsable(element) && isBookingLabel(element));
+    if (controls.length === 0) {
+        return { found: false };
+    }
+    controls.sort((left, right) => {
+        const leftRect = left.getBoundingClientRect();
+        const rightRect = right.getBoundingClientRect();
+        if (rightRect.top !== leftRect.top) {
+            return rightRect.top - leftRect.top;
+        }
+        return (rightRect.width * rightRect.height) - (leftRect.width * leftRect.height);
+    });
+    const control = controls[0];
+    control.scrollIntoView({ block: 'center', inline: 'center' });
+    const rect = control.getBoundingClientRect();
+    return { found: true, x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+})()
+)JS");
+
+    const int commandId = sendRecorderCommand(QStringLiteral("Runtime.evaluate"),
+                                              {{QStringLiteral("expression"), expression},
+                                               {QStringLiteral("returnByValue"), true},
+                                               {QStringLiteral("awaitPromise"), true},
+                                               {QStringLiteral("userGesture"), true}},
+                                              sessionId);
+    if (commandId == 0) {
+        m_autoBookingInProgress = false;
+        m_autoBookingSeatType.clear();
+        m_autoBookingClickX = 0.0;
+        m_autoBookingClickY = 0.0;
+        m_autoBookingConfirmationAttempts = 0;
+        m_autoBookingWaitingForSelectionNotice = false;
+        stopTrainRefreshMacro();
+        showStatus(tr("하단 예매 버튼을 확인할 수 없습니다."), true);
+        return;
+    }
+    m_recorderRequests.insert(commandId,
+                              {RecorderRequestType::AutoBookingConfirm, {}, {}, sessionId, false});
+}
+
+void MainWindow::continueAutoBookingWithInformationalDialogs(const QString &sessionId)
+{
+    if (!m_trainRefreshMacroActive || !m_autoBookingInProgress || sessionId.isEmpty()
+        || !isRecorderActive() || !m_recorderSessions.contains(sessionId)) {
+        return;
+    }
+
+    const QString expression = QStringLiteral(R"JS(
+(() => {
+    const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+    const isVisible = (element) => {
+        if (!element) {
+            return false;
+        }
+        const style = window.getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden'
+            && rect.width > 0 && rect.height > 0;
+    };
+    const labelFor = (element) => clean(
+        element.innerText || element.value || element.textContent
+        || element.getAttribute('aria-label') || element.getAttribute('title')
+    );
+    const isUsable = (element) => isVisible(element)
+        && !element.disabled && element.getAttribute('aria-disabled') !== 'true';
+    const dialogs = [
+        document.getElementById('layerPopup'),
+        ...document.querySelectorAll('[role="dialog"], .layerPopup, .layer_wrap, .modal, .popup')
+    ].filter((element, index, elements) => element && elements.indexOf(element) === index && isVisible(element));
+    const popup = dialogs.find((element) => /이용안내/.test(clean(element.innerText || element.textContent)))
+        || dialogs[0];
+    if (!popup) {
+        return { found: false };
+    }
+    const controls = Array.from(popup.querySelectorAll(
+        'button, a, input[type="button"], input[type="submit"], [role="button"]'
+    )).filter(isUsable);
+    const hasNegativeChoice = controls.some((element) => /^(취소|아니오)$/.test(labelFor(element)));
+    if (hasNegativeChoice) {
+        return { found: false };
+    }
+    const control = controls.find((element) => element.matches('button.btn_pop-close'))
+        || controls.find((element) => /^(확인|닫기|알겠습니다|예)$/.test(labelFor(element)));
+    if (!control) {
+        return { found: false };
+    }
+    if (%1) {
+        const eventOptions = { bubbles: true, cancelable: true, view: window };
+        control.focus({ preventScroll: true });
+        try { control.dispatchEvent(new PointerEvent('pointerdown', eventOptions)); } catch (_) {}
+        control.dispatchEvent(new MouseEvent('mousedown', eventOptions));
+        control.dispatchEvent(new MouseEvent('mouseup', eventOptions));
+        control.click();
+        return { found: true, clicked: true };
+    }
+    control.scrollIntoView({ block: 'center', inline: 'center' });
+    const rect = control.getBoundingClientRect();
+    return { found: rect.width > 0 && rect.height > 0,
+             x: rect.left + rect.width / 2,
+             y: rect.top + rect.height / 2 };
+})()
+)JS")
+                                   .arg(m_autoBookingDialogClicks > 0
+                                            && !m_autoBookingDialogDomFallbackUsed
+                                        ? QStringLiteral("true")
+                                        : QStringLiteral("false"));
+
+    const int commandId = sendRecorderCommand(QStringLiteral("Runtime.evaluate"),
+                                              {{QStringLiteral("expression"), expression},
+                                               {QStringLiteral("returnByValue"), true},
+                                               {QStringLiteral("awaitPromise"), true},
+                                               {QStringLiteral("userGesture"), true}},
+                                              sessionId);
+    if (commandId == 0) {
+        m_autoBookingInProgress = false;
+        m_autoBookingSeatType.clear();
+        m_autoBookingClickX = 0.0;
+        m_autoBookingClickY = 0.0;
+        m_autoBookingConfirmationAttempts = 0;
+        m_autoBookingDialogAttempts = 0;
+        m_autoBookingDialogClicks = 0;
+        m_autoBookingDialogDomFallbackUsed = false;
+        m_autoBookingWaitingForSelectionNotice = false;
+        stopTrainRefreshMacro();
+        showStatus(tr("안내 메시지를 확인할 수 없습니다."), true);
+        return;
+    }
+    m_recorderRequests.insert(commandId,
+                              {RecorderRequestType::AutoBookingDismissDialog, {}, {}, sessionId, false});
 }
 
 void MainWindow::saveDomSnapshot(const RecorderRequest &request, const QJsonObject &result)

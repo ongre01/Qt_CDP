@@ -8,12 +8,14 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QHeaderView>
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QProcess>
 #include <QRegularExpression>
 #include <QSaveFile>
 #include <QStandardPaths>
+#include <QTableWidgetItem>
 #include <QUrl>
 
 MainWindow::MainWindow(QWidget *parent)
@@ -30,6 +32,16 @@ MainWindow::MainWindow(QWidget *parent)
             this, &MainWindow::togglePageRecording);
 
     ui->snapshotDirectoryEdit->setText(defaultSnapshotDirectory());
+    ui->trainInfoTableWidget->setColumnCount(7);
+    ui->trainInfoTableWidget->setHorizontalHeaderLabels(
+        {tr("열차"), tr("번호"), tr("출발"), tr("출발 시각"),
+         tr("도착"), tr("도착 시각"), tr("좌석/예매")});
+    ui->trainInfoTableWidget->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+    ui->trainInfoTableWidget->horizontalHeader()->setStretchLastSection(true);
+    ui->trainInfoTableWidget->verticalHeader()->setVisible(false);
+    ui->trainInfoTableWidget->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    ui->trainInfoTableWidget->setSelectionBehavior(QAbstractItemView::SelectRows);
+    ui->trainInfoGroupBox->setVisible(false);
 
     m_cdpReadyTimer.setInterval(200);
     connect(&m_cdpReadyTimer, &QTimer::timeout,
@@ -491,6 +503,7 @@ void MainWindow::stopPageRecording(const QString &message)
     m_recorderRequests.clear();
     m_recorderSessions.clear();
     m_targetToRecorderSession.clear();
+    clearTrainInfoTable();
     ui->pageRecordingButton->setEnabled(true);
     ui->pageRecordingButton->setText(tr("방문 페이지 기록 시작"));
 
@@ -594,6 +607,7 @@ void MainWindow::onRecorderSocketDisconnected()
     m_recorderRequests.clear();
     m_recorderSessions.clear();
     m_targetToRecorderSession.clear();
+    clearTrainInfoTable();
     ui->pageRecordingButton->setEnabled(true);
     ui->pageRecordingButton->setText(tr("방문 페이지 기록 시작"));
 
@@ -641,9 +655,13 @@ void MainWindow::handleRecorderEvent(const QJsonObject &event)
     }
     if (method == QStringLiteral("Target.detachedFromTarget")) {
         const QString sessionId = parameters.value(QStringLiteral("sessionId")).toString();
+        const bool wasTrainInfoSession = sessionId == m_trainInfoSessionId;
         if (m_recorderSessions.contains(sessionId)) {
             m_targetToRecorderSession.remove(m_recorderSessions.value(sessionId).targetId);
             m_recorderSessions.remove(sessionId);
+        }
+        if (wasTrainInfoSession) {
+            clearTrainInfoTable();
         }
         return;
     }
@@ -655,6 +673,17 @@ void MainWindow::handleRecorderEvent(const QJsonObject &event)
             RecorderSession &session = m_recorderSessions[sessionId];
             session.url = targetInfo.value(QStringLiteral("url")).toString();
             session.title = targetInfo.value(QStringLiteral("title")).toString();
+        }
+        return;
+    }
+    if (method == QStringLiteral("Runtime.consoleAPICalled")) {
+        const QJsonArray arguments = parameters.value(QStringLiteral("args")).toArray();
+        for (const QJsonValue &argument : arguments) {
+            if (argument.toObject().value(QStringLiteral("value")).toString()
+                == QStringLiteral("__qt_cdp_train_results_changed__")) {
+                schedulePageSnapshot(event.value(QStringLiteral("sessionId")).toString(), 300);
+                break;
+            }
         }
         return;
     }
@@ -692,6 +721,42 @@ void MainWindow::attachRecorderToPage(const QJsonObject &parameters)
     m_targetToRecorderSession.insert(targetId, sessionId);
 
     sendRecorderCommand(QStringLiteral("Page.enable"), {}, sessionId);
+    sendRecorderCommand(QStringLiteral("Runtime.enable"), {}, sessionId);
+
+    static const QString trainResultObserver = QStringLiteral(R"JS(
+(() => {
+    if (window.__qtCdpTrainResultObserverInstalled) {
+        return;
+    }
+    window.__qtCdpTrainResultObserverInstalled = true;
+    let notificationScheduled = false;
+    const notifyWhenTrainResultsAppear = () => {
+        const text = (document.body && document.body.innerText || '').replace(/\s+/g, ' ');
+        const isTicketReservationPage = /승차권\s*예매|열차\s*(조회|예매)|출발역\s*.*도착역/.test(text);
+        const hasTrainRows = Array.from(document.querySelectorAll('table tbody tr')).some((row) => {
+            const rowText = (row.innerText || row.textContent || '').replace(/\s+/g, ' ');
+            const times = rowText.match(/(?:[01]?\d|2[0-3]):[0-5]\d/g) || [];
+            return times.length >= 2 && /예매|예약|좌석|매진|입석|잔여|특실|일반실/.test(rowText);
+        });
+        if (!isTicketReservationPage || !hasTrainRows || notificationScheduled) {
+            return;
+        }
+        notificationScheduled = true;
+        setTimeout(() => {
+            notificationScheduled = false;
+            console.debug('__qt_cdp_train_results_changed__');
+        }, 250);
+    };
+    new MutationObserver(notifyWhenTrainResultsAppear).observe(document.documentElement,
+                                                                 { childList: true, subtree: true, characterData: true });
+    document.addEventListener('click', () => setTimeout(notifyWhenTrainResultsAppear, 250), true);
+    notifyWhenTrainResultsAppear();
+})()
+)JS");
+    sendRecorderCommand(QStringLiteral("Page.addScriptToEvaluateOnNewDocument"),
+                        {{QStringLiteral("source"), trainResultObserver}}, sessionId);
+    sendRecorderCommand(QStringLiteral("Runtime.evaluate"),
+                        {{QStringLiteral("expression"), trainResultObserver}}, sessionId);
     schedulePageSnapshot(sessionId, 800);
 }
 
@@ -839,12 +904,71 @@ void MainWindow::capturePageSnapshot(const QString &sessionId)
             rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
         };
     });
+
+    const cleanText = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+    const bodyText = cleanText(document.body && document.body.innerText);
+    const ticketReservationPage = /승차권\s*예매|열차\s*(조회|예매)|출발역\s*.*도착역/.test(bodyText);
+    const trains = [];
+    const seenRows = new Set();
+    const textFor = (element) => cleanText(element && (element.innerText || element.textContent));
+    const cellFor = (headers, values, names) => {
+        const index = headers.findIndex((header) => names.some((name) => header.includes(name)));
+        return index >= 0 ? (values[index] || '') : '';
+    };
+    const addTrainRow = (row, headers = []) => {
+        if (trains.length >= 200) {
+            return;
+        }
+        const cells = Array.from(row.querySelectorAll(':scope > th, :scope > td'));
+        const values = cells.map(textFor).filter(Boolean);
+        const rowText = cleanText(values.join(' '));
+        const times = rowText.match(/(?:[01]?\d|2[0-3]):[0-5]\d/g) || [];
+        const hasBookingInfo = /예매|예약|좌석|매진|입석|잔여|특실|일반실/.test(rowText);
+        if (times.length < 2 || !hasBookingInfo) {
+            return;
+        }
+
+        const normalizedHeaders = headers.map(cleanText);
+        const trainType = cellFor(normalizedHeaders, values, ['열차종류', '열차명', '열차'])
+            || (rowText.match(/KTX(?:-산천)?|SRT|ITX-?(?:새마을|마음)|새마을호|무궁화호|누리로|통근열차/i) || [''])[0];
+        const trainNumber = row.getAttribute('data-train-no')
+            || row.getAttribute('data-trainno')
+            || row.getAttribute('data-train-number')
+            || cellFor(normalizedHeaders, values, ['열차번호', '번호'])
+            || (rowText.match(/(?:열차\s*번호\s*)?(\d{3,5})\s*호?/) || ['', ''])[1];
+        const stationPair = rowText.match(/([가-힣A-Za-z0-9]+)\s*(?:역)?\s*(?:→|->|~|-)\s*([가-힣A-Za-z0-9]+)\s*(?:역)?/);
+        const departure = cellFor(normalizedHeaders, values, ['출발역', '출발지'])
+            || (stationPair ? stationPair[1] : '');
+        const arrival = cellFor(normalizedHeaders, values, ['도착역', '도착지'])
+            || (stationPair ? stationPair[2] : '');
+        const departureTime = cellFor(normalizedHeaders, values, ['출발시간', '출발 시각']) || times[0];
+        const arrivalTime = cellFor(normalizedHeaders, values, ['도착시간', '도착 시각']) || times[1];
+        const availability = values.filter((value) => /예매|예약|좌석|매진|입석|잔여|특실|일반실/.test(value))
+            .join(' / ');
+        const signature = [trainType, trainNumber, departure, departureTime, arrival, arrivalTime, availability]
+            .join('|');
+        if (seenRows.has(signature)) {
+            return;
+        }
+        seenRows.add(signature);
+        trains.push({ trainType, trainNumber, departure, departureTime, arrival, arrivalTime, availability });
+    };
+
+    Array.from(document.querySelectorAll('table')).forEach((table) => {
+        const headers = Array.from(table.querySelectorAll('thead th')).map(textFor);
+        Array.from(table.querySelectorAll('tbody tr')).forEach((row) => addTrainRow(row, headers));
+    });
+    Array.from(document.querySelectorAll('[data-train-no], [data-trainno], [data-train-number]'))
+        .forEach((element) => addTrainRow(element.closest('tr') || element));
+
     return {
         capturedAt: new Date().toISOString(),
         url: redactUrl(location.href),
         title: document.title,
         readyState: document.readyState,
         viewport: { width: window.innerWidth, height: window.innerHeight, devicePixelRatio: window.devicePixelRatio },
+        ticketReservationPage,
+        trains,
         documentHtml: '<!DOCTYPE html>\n' + rootClone.outerHTML,
         actionableElements
     };
@@ -888,6 +1012,13 @@ void MainWindow::savePageData(const RecorderRequest &request, const QJsonObject 
         return;
     }
 
+    if (page.value(QStringLiteral("ticketReservationPage")).toBool()) {
+        m_trainInfoSessionId = request.sessionId;
+        updateTrainInfoTable(page.value(QStringLiteral("trains")).toArray());
+    } else if (request.sessionId == m_trainInfoSessionId) {
+        clearTrainInfoTable();
+    }
+
     const QJsonObject document {
         {QStringLiteral("schemaVersion"), 1},
         {QStringLiteral("captureId"), request.captureId},
@@ -917,6 +1048,43 @@ void MainWindow::savePageData(const RecorderRequest &request, const QJsonObject 
                             {QStringLiteral("domSnapshotFile"),
                              QDir(request.captureId).filePath(QStringLiteral("dom-snapshot.json"))}});
     showStatus(tr("페이지 정보를 저장했습니다: %1").arg(page.value(QStringLiteral("title")).toString()));
+}
+
+void MainWindow::updateTrainInfoTable(const QJsonArray &trains)
+{
+    ui->trainInfoTableWidget->setUpdatesEnabled(false);
+    ui->trainInfoTableWidget->setRowCount(0);
+
+    for (const QJsonValue &value : trains) {
+        const QJsonObject train = value.toObject();
+        const int row = ui->trainInfoTableWidget->rowCount();
+        ui->trainInfoTableWidget->insertRow(row);
+        const QStringList columns {
+            train.value(QStringLiteral("trainType")).toString(),
+            train.value(QStringLiteral("trainNumber")).toString(),
+            train.value(QStringLiteral("departure")).toString(),
+            train.value(QStringLiteral("departureTime")).toString(),
+            train.value(QStringLiteral("arrival")).toString(),
+            train.value(QStringLiteral("arrivalTime")).toString(),
+            train.value(QStringLiteral("availability")).toString()
+        };
+        for (int column = 0; column < columns.size(); ++column) {
+            auto *item = new QTableWidgetItem(columns.at(column));
+            item->setToolTip(columns.at(column));
+            ui->trainInfoTableWidget->setItem(row, column, item);
+        }
+    }
+
+    ui->trainInfoTableWidget->setUpdatesEnabled(true);
+    ui->trainInfoGroupBox->setTitle(tr("열차 정보 (%1건)").arg(trains.size()));
+    ui->trainInfoGroupBox->setVisible(true);
+}
+
+void MainWindow::clearTrainInfoTable()
+{
+    m_trainInfoSessionId.clear();
+    ui->trainInfoTableWidget->setRowCount(0);
+    ui->trainInfoGroupBox->setVisible(false);
 }
 
 void MainWindow::saveDomSnapshot(const RecorderRequest &request, const QJsonObject &result)

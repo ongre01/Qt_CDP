@@ -6,8 +6,8 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>640</width>
-    <height>470</height>
+    <width>980</width>
+    <height>720</height>
    </rect>
   </property>
   <property name="windowTitle">
@@ -96,6 +96,25 @@
         <widget class="QPushButton" name="pageRecordingButton">
          <property name="text">
           <string>방문 페이지 기록 시작</string>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+    </item>
+    <item>
+     <widget class="QGroupBox" name="trainInfoGroupBox">
+      <property name="title">
+       <string>열차 정보</string>
+      </property>
+      <layout class="QVBoxLayout" name="trainInfoLayout">
+       <item>
+        <widget class="QTableWidget" name="trainInfoTableWidget">
+         <property name="alternatingRowColors">
+          <bool>true</bool>
+         </property>
+         <property name="selectionMode">
+          <enum>QAbstractItemView::SingleSelection</enum>
          </property>
         </widget>
        </item>

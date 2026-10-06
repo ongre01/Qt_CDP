@@ -3,6 +3,7 @@
 
 #include <QMainWindow>
 #include <QDateTime>
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QNetworkAccessManager>
 #include <QHash>
@@ -84,6 +85,8 @@ private:
     void capturePageSnapshot(const QString &sessionId);
     void savePageData(const RecorderRequest &request, const QJsonObject &result);
     void saveDomSnapshot(const RecorderRequest &request, const QJsonObject &result);
+    void updateTrainInfoTable(const QJsonArray &trains);
+    void clearTrainInfoTable();
     bool writeJsonFile(const QString &filePath, const QJsonObject &document) const;
     void appendSnapshotManifest(const QString &directory, const QJsonObject &entry) const;
     static QJsonObject redactDomSnapshot(QJsonObject snapshot);
@@ -115,5 +118,6 @@ private:
     QHash<QString, RecorderSession> m_recorderSessions;
     QHash<QString, QString> m_targetToRecorderSession;
     QHash<int, RecorderRequest> m_recorderRequests;
+    QString m_trainInfoSessionId;
 };
 #endif // MAINWINDOW_H

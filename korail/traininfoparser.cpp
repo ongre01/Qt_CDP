@@ -195,7 +195,9 @@ bool TrainInfoParser::isReservableSeatText(const QString &seatText)
         || text.contains(QStringLiteral("예약"));
     const bool indicatesFare = QRegularExpression(
         QStringLiteral("\\b\\d{1,3}(?:,\\d{3})*\\s*원")).match(text).hasMatch();
-    const bool indicatesUnavailability = text.contains(QStringLiteral("매진"))
+    const bool indicatesNearlySoldOut = QRegularExpression(
+        QStringLiteral("매진\\s*임박")).match(text).hasMatch();
+    const bool indicatesUnavailability = (text.contains(QStringLiteral("매진")) && !indicatesNearlySoldOut)
         || text.contains(QStringLiteral("없음")) || text.contains(QStringLiteral("불가"))
         || text.contains(QStringLiteral("대기"));
     return (indicatesReservation || indicatesFare) && !indicatesUnavailability;

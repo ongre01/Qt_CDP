@@ -223,9 +223,9 @@ MainWindow::MainWindow(QWidget *parent)
             this, &MainWindow::togglePageRecording);
 
     ui->snapshotDirectoryEdit->setText(defaultSnapshotDirectory());
-    ui->trainInfoTableWidget->setColumnCount(9);
+    ui->trainInfoTableWidget->setColumnCount(10);
     ui->trainInfoTableWidget->setHorizontalHeaderLabels(
-        {tr("열차"), tr("번호"), tr("출발역"), tr("출발 시각"),
+        {tr("선택"), tr("열차"), tr("번호"), tr("출발역"), tr("출발 시각"),
          tr("도착역"), tr("도착 시각"), tr("소요 시간"), tr("일반실"), tr("특실")});
     ui->trainInfoTableWidget->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
     ui->trainInfoTableWidget->horizontalHeader()->setStretchLastSection(true);
@@ -1168,6 +1168,11 @@ void MainWindow::updateTrainInfoTable(const QJsonArray &trains)
         const QJsonObject train = value.toObject();
         const int row = ui->trainInfoTableWidget->rowCount();
         ui->trainInfoTableWidget->insertRow(row);
+        auto *selectionItem = new QTableWidgetItem;
+        selectionItem->setFlags(selectionItem->flags() | Qt::ItemIsUserCheckable);
+        selectionItem->setCheckState(Qt::Unchecked);
+        selectionItem->setToolTip(tr("이 열차 선택"));
+        ui->trainInfoTableWidget->setItem(row, 0, selectionItem);
         const QStringList columns {
             train.value(QStringLiteral("trainType")).toString(),
             train.value(QStringLiteral("trainNumber")).toString(),
@@ -1182,7 +1187,7 @@ void MainWindow::updateTrainInfoTable(const QJsonArray &trains)
         for (int column = 0; column < columns.size(); ++column) {
             auto *item = new QTableWidgetItem(columns.at(column));
             item->setToolTip(columns.at(column));
-            ui->trainInfoTableWidget->setItem(row, column, item);
+            ui->trainInfoTableWidget->setItem(row, column + 1, item);
         }
     }
 

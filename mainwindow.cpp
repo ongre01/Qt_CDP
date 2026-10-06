@@ -14,9 +14,200 @@
 #include <QProcess>
 #include <QRegularExpression>
 #include <QSaveFile>
+#include <QSet>
 #include <QStandardPaths>
 #include <QTableWidgetItem>
 #include <QUrl>
+#include <QVector>
+
+namespace {
+
+QString normalizedText(const QString &text)
+{
+    QString result = text;
+    result.replace(QRegularExpression(QStringLiteral("\\s+")), QStringLiteral(" "));
+    return result.trimmed();
+}
+
+QJsonArray trainInfoFromDomSnapshot(const QJsonObject &snapshot, bool *isTicketReservationPage)
+{
+    if (isTicketReservationPage) {
+        *isTicketReservationPage = false;
+    }
+
+    const QJsonArray documents = snapshot.value(QStringLiteral("documents")).toArray();
+    const QJsonArray strings = snapshot.value(QStringLiteral("strings")).toArray();
+    if (documents.isEmpty() || strings.isEmpty()) {
+        return {};
+    }
+
+    const QJsonObject nodes = documents.first().toObject().value(QStringLiteral("nodes")).toObject();
+    const QJsonArray nodeNames = nodes.value(QStringLiteral("nodeName")).toArray();
+    const QJsonArray nodeValues = nodes.value(QStringLiteral("nodeValue")).toArray();
+    const QJsonArray parentIndexes = nodes.value(QStringLiteral("parentIndex")).toArray();
+    const QJsonArray attributes = nodes.value(QStringLiteral("attributes")).toArray();
+    if (nodeNames.isEmpty() || parentIndexes.size() != nodeNames.size()) {
+        return {};
+    }
+
+    const auto stringAt = [&strings](int index) {
+        return index >= 0 && index < strings.size() ? strings.at(index).toString() : QString();
+    };
+    const auto nodeName = [&nodeNames, &stringAt](int index) {
+        return stringAt(nodeNames.at(index).toInt(-1)).toLower();
+    };
+    const auto attributeValue = [&attributes, &stringAt](int nodeIndex, const QString &attributeName) {
+        if (nodeIndex < 0 || nodeIndex >= attributes.size()) {
+            return QString();
+        }
+        const QJsonArray pairs = attributes.at(nodeIndex).toArray();
+        for (int pairIndex = 0; pairIndex + 1 < pairs.size(); pairIndex += 2) {
+            if (stringAt(pairs.at(pairIndex).toInt(-1)).compare(attributeName, Qt::CaseInsensitive) == 0) {
+                return stringAt(pairs.at(pairIndex + 1).toInt(-1));
+            }
+        }
+        return QString();
+    };
+
+    QVector<QVector<int>> children(nodeNames.size());
+    for (int index = 0; index < parentIndexes.size(); ++index) {
+        const int parentIndex = parentIndexes.at(index).toInt(-1);
+        if (parentIndex >= 0 && parentIndex < children.size()) {
+            children[parentIndex].append(index);
+        }
+    }
+
+    const auto textForSubtree = [&children, &nodeName, &nodeValues, &stringAt](int root) {
+        QStringList fragments;
+        QVector<int> pending {root};
+        while (!pending.isEmpty()) {
+            const int index = pending.takeLast();
+            if (nodeName(index) == QStringLiteral("#text")) {
+                const int valueIndex = index < nodeValues.size()
+                    ? nodeValues.at(index).toInt(-1)
+                    : -1;
+                fragments.append(stringAt(valueIndex));
+            }
+            const QVector<int> &childNodes = children.at(index);
+            for (auto child = childNodes.crbegin(); child != childNodes.crend(); ++child) {
+                pending.append(*child);
+            }
+        }
+        return normalizedText(fragments.join(QLatin1Char(' ')));
+    };
+    const auto textForClassToken = [&children, &attributeValue, &textForSubtree](int root,
+                                                                                   const QString &classToken) {
+        QVector<int> pending {root};
+        while (!pending.isEmpty()) {
+            const int index = pending.takeLast();
+            const QStringList classes = attributeValue(index, QStringLiteral("class"))
+                                            .split(QRegularExpression(QStringLiteral("\\s+")),
+                                                   Qt::SkipEmptyParts);
+            if (classes.contains(classToken, Qt::CaseInsensitive)) {
+                return textForSubtree(index);
+            }
+            const QVector<int> &childNodes = children.at(index);
+            for (auto child = childNodes.crbegin(); child != childNodes.crend(); ++child) {
+                pending.append(*child);
+            }
+        }
+        return QString();
+    };
+
+    int bodyIndex = -1;
+    for (int index = 0; index < nodeNames.size(); ++index) {
+        if (nodeName(index) == QStringLiteral("body")) {
+            bodyIndex = index;
+            break;
+        }
+    }
+    const QString pageText = bodyIndex >= 0 ? textForSubtree(bodyIndex) : textForSubtree(0);
+    const bool reservationPage = QRegularExpression(
+        QStringLiteral("승차권\\s*예매|열차\\s*(조회|예매)|출발역\\s*.*도착역"))
+                                     .match(pageText)
+                                     .hasMatch();
+    if (isTicketReservationPage) {
+        *isTicketReservationPage = reservationPage;
+    }
+    if (!reservationPage) {
+        return {};
+    }
+
+    const QRegularExpression timePattern(QStringLiteral("(?:[01]?\\d|2[0-3]):[0-5]\\d"));
+    const QRegularExpression trainTypePattern(
+        QStringLiteral("KTX(?:-산천)?|SRT|ITX-?(?:새마을|마음)|새마을호|무궁화호|누리로|통근열차"),
+        QRegularExpression::CaseInsensitiveOption);
+    const QRegularExpression trainNumberPattern(QStringLiteral("(?:열차\\s*번호\\s*)?(\\d{3,5})\\s*호?"));
+    const QRegularExpression stationPairPattern(
+        QStringLiteral("([가-힣A-Za-z0-9]+)\\s*(?:역)?\\s*(?:→|->|~|-)\\s*([가-힣A-Za-z0-9]+)\\s*(?:역)?"));
+    const QRegularExpression availabilityPattern(QStringLiteral("예매|예약|좌석|매진|입석|잔여|특실|일반실"));
+    QSet<QString> seenRows;
+    QJsonArray trains;
+
+    for (int index = 0; index < nodeNames.size() && trains.size() < 200; ++index) {
+        const QString tagName = nodeName(index);
+        const bool isTrainListItem = tagName == QStringLiteral("li")
+            && attributeValue(index, QStringLiteral("class"))
+                   .contains(QStringLiteral("tckList"), Qt::CaseInsensitive);
+        if (tagName != QStringLiteral("tr") && !isTrainListItem) {
+            continue;
+        }
+
+        const QString rowText = textForSubtree(index);
+        const QString titleText = isTrainListItem
+            ? textForClassToken(index, QStringLiteral("tit_box"))
+            : rowText;
+        const QString travelText = isTrainListItem
+            ? textForClassToken(index, QStringLiteral("data_box"))
+            : rowText;
+        const QString generalSeat = isTrainListItem
+            ? textForClassToken(index, QStringLiteral("gen"))
+            : rowText;
+        const QString specialSeat = isTrainListItem
+            ? textForClassToken(index, QStringLiteral("spe"))
+            : QString();
+        QRegularExpressionMatchIterator timeMatches = timePattern.globalMatch(travelText);
+        QStringList times;
+        while (timeMatches.hasNext()) {
+            times.append(timeMatches.next().captured(0));
+        }
+        if (times.size() < 2 || !availabilityPattern.match(rowText).hasMatch()) {
+            continue;
+        }
+
+        const QRegularExpressionMatch typeMatch = trainTypePattern.match(titleText);
+        const QRegularExpressionMatch numberMatch = trainNumberPattern.match(titleText);
+        const QRegularExpressionMatch stationMatch = stationPairPattern.match(travelText);
+        const QRegularExpressionMatch durationMatch = QRegularExpression(
+            QStringLiteral("소요시간\\s*:\\s*(.+)$")).match(travelText);
+        const QString trainType = typeMatch.hasMatch() ? typeMatch.captured(0) : QString();
+        const QString trainNumber = numberMatch.hasMatch() ? numberMatch.captured(1) : QString();
+        const QString departure = stationMatch.hasMatch() ? stationMatch.captured(1) : QString();
+        const QString arrival = stationMatch.hasMatch() ? stationMatch.captured(2) : QString();
+        const QString duration = durationMatch.hasMatch() ? durationMatch.captured(1).trimmed() : QString();
+        const QString signature = QStringList {trainType, trainNumber, departure, times.at(0),
+                                               arrival, times.at(1), duration, generalSeat, specialSeat}
+                                      .join(QLatin1Char('|'));
+        if (seenRows.contains(signature)) {
+            continue;
+        }
+        seenRows.insert(signature);
+        trains.append(QJsonObject {
+            {QStringLiteral("trainType"), trainType},
+            {QStringLiteral("trainNumber"), trainNumber},
+            {QStringLiteral("departure"), departure},
+            {QStringLiteral("departureTime"), times.at(0)},
+            {QStringLiteral("arrival"), arrival},
+            {QStringLiteral("arrivalTime"), times.at(1)},
+            {QStringLiteral("duration"), duration},
+            {QStringLiteral("generalSeat"), generalSeat},
+            {QStringLiteral("specialSeat"), specialSeat}
+        });
+    }
+    return trains;
+}
+
+} // namespace
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
@@ -32,10 +223,10 @@ MainWindow::MainWindow(QWidget *parent)
             this, &MainWindow::togglePageRecording);
 
     ui->snapshotDirectoryEdit->setText(defaultSnapshotDirectory());
-    ui->trainInfoTableWidget->setColumnCount(7);
+    ui->trainInfoTableWidget->setColumnCount(9);
     ui->trainInfoTableWidget->setHorizontalHeaderLabels(
-        {tr("열차"), tr("번호"), tr("출발"), tr("출발 시각"),
-         tr("도착"), tr("도착 시각"), tr("좌석/예매")});
+        {tr("열차"), tr("번호"), tr("출발역"), tr("출발 시각"),
+         tr("도착역"), tr("도착 시각"), tr("소요 시간"), tr("일반실"), tr("특실")});
     ui->trainInfoTableWidget->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
     ui->trainInfoTableWidget->horizontalHeader()->setStretchLastSection(true);
     ui->trainInfoTableWidget->verticalHeader()->setVisible(false);
@@ -565,7 +756,7 @@ void MainWindow::onRecorderTextMessageReceived(const QString &message)
     const bool failed = !response.value(QStringLiteral("error")).toObject().isEmpty()
                         || !result.value(QStringLiteral("exceptionDetails")).toObject().isEmpty();
     if (failed) {
-        if (request.type == RecorderRequestType::PageData
+        if (request.type == RecorderRequestType::DomSnapshot
             && m_recorderSessions.contains(request.sessionId)) {
             m_recorderSessions[request.sessionId].captureInFlight = false;
         }
@@ -590,9 +781,6 @@ void MainWindow::onRecorderTextMessageReceived(const QString &message)
         }
         return;
     }
-    case RecorderRequestType::PageData:
-        savePageData(request, result);
-        return;
     case RecorderRequestType::DomSnapshot:
         saveDomSnapshot(request, result);
         return;
@@ -676,15 +864,8 @@ void MainWindow::handleRecorderEvent(const QJsonObject &event)
         }
         return;
     }
-    if (method == QStringLiteral("Runtime.consoleAPICalled")) {
-        const QJsonArray arguments = parameters.value(QStringLiteral("args")).toArray();
-        for (const QJsonValue &argument : arguments) {
-            if (argument.toObject().value(QStringLiteral("value")).toString()
-                == QStringLiteral("__qt_cdp_train_results_changed__")) {
-                schedulePageSnapshot(event.value(QStringLiteral("sessionId")).toString(), 300);
-                break;
-            }
-        }
+    if (method == QStringLiteral("Network.loadingFinished")) {
+        schedulePageSnapshot(event.value(QStringLiteral("sessionId")).toString(), 700);
         return;
     }
     if (method == QStringLiteral("Page.loadEventFired")
@@ -721,42 +902,7 @@ void MainWindow::attachRecorderToPage(const QJsonObject &parameters)
     m_targetToRecorderSession.insert(targetId, sessionId);
 
     sendRecorderCommand(QStringLiteral("Page.enable"), {}, sessionId);
-    sendRecorderCommand(QStringLiteral("Runtime.enable"), {}, sessionId);
-
-    static const QString trainResultObserver = QStringLiteral(R"JS(
-(() => {
-    if (window.__qtCdpTrainResultObserverInstalled) {
-        return;
-    }
-    window.__qtCdpTrainResultObserverInstalled = true;
-    let notificationScheduled = false;
-    const notifyWhenTrainResultsAppear = () => {
-        const text = (document.body && document.body.innerText || '').replace(/\s+/g, ' ');
-        const isTicketReservationPage = /승차권\s*예매|열차\s*(조회|예매)|출발역\s*.*도착역/.test(text);
-        const hasTrainRows = Array.from(document.querySelectorAll('table tbody tr')).some((row) => {
-            const rowText = (row.innerText || row.textContent || '').replace(/\s+/g, ' ');
-            const times = rowText.match(/(?:[01]?\d|2[0-3]):[0-5]\d/g) || [];
-            return times.length >= 2 && /예매|예약|좌석|매진|입석|잔여|특실|일반실/.test(rowText);
-        });
-        if (!isTicketReservationPage || !hasTrainRows || notificationScheduled) {
-            return;
-        }
-        notificationScheduled = true;
-        setTimeout(() => {
-            notificationScheduled = false;
-            console.debug('__qt_cdp_train_results_changed__');
-        }, 250);
-    };
-    new MutationObserver(notifyWhenTrainResultsAppear).observe(document.documentElement,
-                                                                 { childList: true, subtree: true, characterData: true });
-    document.addEventListener('click', () => setTimeout(notifyWhenTrainResultsAppear, 250), true);
-    notifyWhenTrainResultsAppear();
-})()
-)JS");
-    sendRecorderCommand(QStringLiteral("Page.addScriptToEvaluateOnNewDocument"),
-                        {{QStringLiteral("source"), trainResultObserver}}, sessionId);
-    sendRecorderCommand(QStringLiteral("Runtime.evaluate"),
-                        {{QStringLiteral("expression"), trainResultObserver}}, sessionId);
+    sendRecorderCommand(QStringLiteral("Network.enable"), {}, sessionId);
     schedulePageSnapshot(sessionId, 800);
 }
 
@@ -805,6 +951,20 @@ void MainWindow::capturePageSnapshot(const QString &sessionId)
         return;
     }
 
+    session.captureInFlight = true;
+    const int domSnapshotCommandId = sendRecorderCommand(QStringLiteral("DOMSnapshot.captureSnapshot"),
+                                                         {{QStringLiteral("computedStyles"), QJsonArray {}},
+                                                          {QStringLiteral("includeDOMRects"), true}},
+                                                         sessionId);
+    if (domSnapshotCommandId == 0) {
+        session.captureInFlight = false;
+        return;
+    }
+    m_recorderRequests.insert(domSnapshotCommandId,
+                              {RecorderRequestType::DomSnapshot, captureId, captureDirectory, sessionId});
+    return;
+
+#if 0 // Replaced by the passive DOMSnapshot path above; retained temporarily for source comparison.
     static const QString captureExpression = QStringLiteral(R"JS(
 (() => {
     const redacted = '[REDACTED]';
@@ -996,58 +1156,7 @@ void MainWindow::capturePageSnapshot(const QString &sessionId)
         m_recorderRequests.insert(domCommandId,
                                   {RecorderRequestType::DomSnapshot, captureId, captureDirectory, sessionId});
     }
-}
-
-void MainWindow::savePageData(const RecorderRequest &request, const QJsonObject &result)
-{
-    if (m_recorderSessions.contains(request.sessionId)) {
-        m_recorderSessions[request.sessionId].captureInFlight = false;
-    }
-
-    const QJsonObject page = result.value(QStringLiteral("result"))
-                                 .toObject()
-                                 .value(QStringLiteral("value"))
-                                 .toObject();
-    if (page.isEmpty()) {
-        return;
-    }
-
-    if (page.value(QStringLiteral("ticketReservationPage")).toBool()) {
-        m_trainInfoSessionId = request.sessionId;
-        updateTrainInfoTable(page.value(QStringLiteral("trains")).toArray());
-    } else if (request.sessionId == m_trainInfoSessionId) {
-        clearTrainInfoTable();
-    }
-
-    const QJsonObject document {
-        {QStringLiteral("schemaVersion"), 1},
-        {QStringLiteral("captureId"), request.captureId},
-        {QStringLiteral("page"), page}
-    };
-    const QString pageFilePath = QDir(request.captureDirectory).filePath(QStringLiteral("page.json"));
-    if (!writeJsonFile(pageFilePath, document)) {
-        showStatus(tr("페이지 HTML 스냅샷을 저장하지 못했습니다."), true);
-        return;
-    }
-
-    if (m_recorderSessions.contains(request.sessionId)) {
-        RecorderSession &session = m_recorderSessions[request.sessionId];
-        session.lastCapturedUrl = page.value(QStringLiteral("url")).toString();
-        session.url = session.lastCapturedUrl;
-        session.title = page.value(QStringLiteral("title")).toString();
-    }
-
-    const QString storageDirectory = QFileInfo(request.captureDirectory).dir().absolutePath();
-    appendSnapshotManifest(storageDirectory,
-                           {{QStringLiteral("schemaVersion"), 1},
-                            {QStringLiteral("captureId"), request.captureId},
-                            {QStringLiteral("capturedAt"), page.value(QStringLiteral("capturedAt"))},
-                            {QStringLiteral("url"), page.value(QStringLiteral("url"))},
-                            {QStringLiteral("title"), page.value(QStringLiteral("title"))},
-                            {QStringLiteral("pageFile"), QDir(request.captureId).filePath(QStringLiteral("page.json"))},
-                            {QStringLiteral("domSnapshotFile"),
-                             QDir(request.captureId).filePath(QStringLiteral("dom-snapshot.json"))}});
-    showStatus(tr("페이지 정보를 저장했습니다: %1").arg(page.value(QStringLiteral("title")).toString()));
+#endif
 }
 
 void MainWindow::updateTrainInfoTable(const QJsonArray &trains)
@@ -1066,7 +1175,9 @@ void MainWindow::updateTrainInfoTable(const QJsonArray &trains)
             train.value(QStringLiteral("departureTime")).toString(),
             train.value(QStringLiteral("arrival")).toString(),
             train.value(QStringLiteral("arrivalTime")).toString(),
-            train.value(QStringLiteral("availability")).toString()
+            train.value(QStringLiteral("duration")).toString(),
+            train.value(QStringLiteral("generalSeat")).toString(),
+            train.value(QStringLiteral("specialSeat")).toString()
         };
         for (int column = 0; column < columns.size(); ++column) {
             auto *item = new QTableWidgetItem(columns.at(column));
@@ -1089,16 +1200,43 @@ void MainWindow::clearTrainInfoTable()
 
 void MainWindow::saveDomSnapshot(const RecorderRequest &request, const QJsonObject &result)
 {
+    if (m_recorderSessions.contains(request.sessionId)) {
+        m_recorderSessions[request.sessionId].captureInFlight = false;
+    }
+
+    bool isTicketReservationPage = false;
+    const QJsonArray trains = trainInfoFromDomSnapshot(result, &isTicketReservationPage);
+    if (isTicketReservationPage) {
+        m_trainInfoSessionId = request.sessionId;
+        updateTrainInfoTable(trains);
+    } else if (request.sessionId == m_trainInfoSessionId) {
+        clearTrainInfoTable();
+    }
+
+    const QJsonObject redactedSnapshot = redactDomSnapshot(result);
+
     const QJsonObject document {
         {QStringLiteral("schemaVersion"), 1},
         {QStringLiteral("captureId"), request.captureId},
         {QStringLiteral("capturedAt"), QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)},
-        {QStringLiteral("domSnapshot"), redactDomSnapshot(result)}
+        {QStringLiteral("domSnapshot"), redactedSnapshot}
     };
     const QString filePath = QDir(request.captureDirectory).filePath(QStringLiteral("dom-snapshot.json"));
     if (!writeJsonFile(filePath, document)) {
         showStatus(tr("DOM 스냅샷을 저장하지 못했습니다."), true);
+        return;
     }
+
+    const RecorderSession session = m_recorderSessions.value(request.sessionId);
+    appendSnapshotManifest(QFileInfo(request.captureDirectory).dir().absolutePath(),
+                           {{QStringLiteral("schemaVersion"), 1},
+                            {QStringLiteral("captureId"), request.captureId},
+                            {QStringLiteral("capturedAt"), document.value(QStringLiteral("capturedAt"))},
+                            {QStringLiteral("url"), session.url},
+                            {QStringLiteral("title"), session.title},
+                            {QStringLiteral("domSnapshotFile"),
+                             QDir(request.captureId).filePath(QStringLiteral("dom-snapshot.json"))}});
+    showStatus(tr("DOM 스냅샷을 저장했습니다: %1").arg(session.title));
 }
 
 bool MainWindow::writeJsonFile(const QString &filePath, const QJsonObject &document) const

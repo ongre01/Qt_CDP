@@ -39,7 +39,6 @@ private:
 
     enum class RecorderRequestType {
         TargetList,
-        PageData,
         DomSnapshot
     };
 
@@ -83,7 +82,6 @@ private:
     void attachRecorderToPage(const QJsonObject &parameters);
     void schedulePageSnapshot(const QString &sessionId, int delayMilliseconds = 500);
     void capturePageSnapshot(const QString &sessionId);
-    void savePageData(const RecorderRequest &request, const QJsonObject &result);
     void saveDomSnapshot(const RecorderRequest &request, const QJsonObject &result);
     void updateTrainInfoTable(const QJsonArray &trains);
     void clearTrainInfoTable();

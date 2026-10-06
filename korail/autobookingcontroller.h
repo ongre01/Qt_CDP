@@ -56,6 +56,7 @@ private:
     void continueWithInformationalDialogs(const QString &sessionId);
     void onCommandResult(int id, const QJsonObject &result);
     void onCommandError(int id, const QString &message);
+    void finishBookingSuccessfully(const QString &message);
     void resetBookingState();
     void failBooking(const QString &message);
     int sendCommand(const QString &method, const QJsonObject &parameters,

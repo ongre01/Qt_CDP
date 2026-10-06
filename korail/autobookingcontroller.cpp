@@ -389,7 +389,13 @@ void AutoBookingController::onCommandResult(int id, const QJsonObject &result)
             QTimer::singleShot(250, this, [this, sessionId = m_sessionId]() { continueWithInformationalDialogs(sessionId); }); return; }
         if (!value.value(QStringLiteral("found")).toBool() || !value.value(QStringLiteral("x")).isDouble() || !value.value(QStringLiteral("y")).isDouble()) {
             if (++m_dialogAttempts < 12) { QTimer::singleShot(250, this, [this, sessionId = m_sessionId]() { continueWithInformationalDialogs(sessionId); }); return; }
-            resetBookingState(); stop(); emit statusChanged(tr("하단 예매 버튼을 눌렀습니다. 예매 화면으로 전환되는지 확인하세요.")); return;
+            if (m_dialogClicks > 0) {
+                finishBookingSuccessfully(tr("안내 메시지를 확인하고 예매 화면으로 전환했습니다."));
+            } else {
+                resetBookingState(); stop();
+                emit statusChanged(tr("하단 예매 버튼을 눌렀습니다. 예매 화면으로 전환되는지 확인하세요."));
+            }
+            return;
         }
         m_clickX = value.value(QStringLiteral("x")).toDouble(); m_clickY = value.value(QStringLiteral("y")).toDouble();
         if (!dispatchMouse(QStringLiteral("mousePressed"), m_sessionId, RequestType::DismissDialogMousePressed)) failBooking(tr("안내 메시지의 확인 버튼에 마우스 입력을 보낼 수 없습니다."));
@@ -399,7 +405,7 @@ void AutoBookingController::onCommandResult(int id, const QJsonObject &result)
         return;
     case RequestType::DismissDialogMouseReleased:
         ++m_dialogClicks; m_dialogAttempts = 0;
-        if (m_dialogClicks >= 3) { resetBookingState(); stop(); emit bookingSucceeded(); emit statusChanged(tr("안내 메시지를 확인하고 예매를 진행했습니다.")); return; }
+        if (m_dialogClicks >= 3) { finishBookingSuccessfully(tr("안내 메시지를 확인하고 예매를 진행했습니다.")); return; }
         emit statusChanged(tr("안내 메시지의 확인 버튼을 눌렀습니다. 예매 화면으로 이동하는 중입니다..."));
         QTimer::singleShot(200, this, [this, sessionId = m_sessionId]() { continueWithInformationalDialogs(sessionId); }); return;
     }
@@ -408,6 +414,14 @@ void AutoBookingController::onCommandResult(int id, const QJsonObject &result)
 void AutoBookingController::onCommandError(int id, const QString &message)
 {
     if (m_requests.contains(id)) { m_requests.remove(id); failBooking(tr("자동 예매 명령을 실행하지 못했습니다: %1").arg(message)); }
+}
+
+void AutoBookingController::finishBookingSuccessfully(const QString &message)
+{
+    resetBookingState();
+    stop();
+    emit bookingSucceeded();
+    emit statusChanged(message);
 }
 
 void AutoBookingController::resetBookingState()

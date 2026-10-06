@@ -12,6 +12,9 @@
 #include <QDesktopServices>
 #include <QDir>
 #include <QHeaderView>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
 #include <QSettings>
 #include <QTableWidgetItem>
 #include <QUrl>
@@ -26,6 +29,7 @@ MainWindow::MainWindow(QWidget *parent)
     , m_authController(new KorailAuthController(m_authCdpClient, this))
     , m_pageRecorder(new PageRecorder(m_recorderCdpClient, m_snapshotStorage, this))
     , m_autoBookingController(new AutoBookingController(m_recorderCdpClient, m_pageRecorder, this))
+    , m_notificationNetworkManager(new QNetworkAccessManager(this))
 {
     ui->setupUi(this);
     QSettings settings(QSettings::IniFormat, QSettings::UserScope,
@@ -113,6 +117,28 @@ MainWindow::MainWindow(QWidget *parent)
             [this](const QString &message) { showStatus(message); });
     connect(m_autoBookingController, &AutoBookingController::bookingFailed, this,
             [this](const QString &message) { showStatus(message, true); });
+    connect(m_autoBookingController, &AutoBookingController::bookingSucceeded, this, [this]() {
+        QNetworkRequest request(QUrl(QStringLiteral("https://ntfy.sh/ktx")));
+        request.setHeader(QNetworkRequest::ContentTypeHeader,
+                          QStringLiteral("text/plain; charset=utf-8"));
+        request.setAttribute(QNetworkRequest::Http2AllowedAttribute, false);
+        request.setRawHeader("Title", QStringLiteral("KTX 예매 완료").toUtf8());
+        request.setRawHeader("Priority", "high");
+
+        QNetworkReply *reply = m_notificationNetworkManager->post(
+            request, QStringLiteral("KTX 예매가 완료되었습니다.").toUtf8());
+        connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+            const int statusCode = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+            if (reply->error() != QNetworkReply::NoError || statusCode < 200 || statusCode >= 300) {
+                showStatus(tr("ntfy 예매 완료 알림을 전송하지 못했습니다: %1")
+                               .arg(reply->errorString()), true);
+            } else {
+                showStatus(tr("ntfy 예매 완료 알림을 전송했습니다 (HTTP %1).")
+                               .arg(statusCode));
+            }
+            reply->deleteLater();
+        });
+    });
 }
 
 MainWindow::~MainWindow()

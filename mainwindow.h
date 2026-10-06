@@ -18,6 +18,7 @@ class CdpClient;
 class KorailAuthController;
 class PageRecorder;
 class QJsonObject;
+class QNetworkAccessManager;
 class QTableWidgetItem;
 class SnapshotStorage;
 
@@ -54,6 +55,7 @@ private:
     KorailAuthController *m_authController;
     PageRecorder *m_pageRecorder;
     AutoBookingController *m_autoBookingController;
+    QNetworkAccessManager *m_notificationNetworkManager;
     QList<TrainInfo> m_currentTrains;
     QSet<QString> m_selectedTrainKeys;
     QString m_trainInfoSessionId;

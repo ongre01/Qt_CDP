@@ -273,9 +273,12 @@ void MainWindow::onDomSnapshotCaptured(const QJsonObject &snapshot, const QStrin
     const QList<TrainInfo> trains = TrainInfoParser::parse(snapshot, &isTicketReservationPage);
     if (isTicketReservationPage) {
         m_trainInfoSessionId = sessionId;
+        if (trains.isEmpty() && m_autoBookingController->isRunning() && !m_currentTrains.isEmpty()) {
+            return;
+        }
         updateTrainInfoTable(trains);
         m_autoBookingController->setTrainInfoContext(sessionId, selectedTrains());
-    } else if (sessionId == m_trainInfoSessionId) {
+    } else if (sessionId == m_trainInfoSessionId && !m_autoBookingController->isRunning()) {
         clearTrainInfoTable();
     }
 }

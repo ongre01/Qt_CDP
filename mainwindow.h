@@ -7,6 +7,7 @@
 #include <QJsonObject>
 #include <QNetworkAccessManager>
 #include <QHash>
+#include <QSet>
 #include <QTimer>
 #include <QUrl>
 #include <QWebSocket>
@@ -16,6 +17,8 @@ namespace Ui {
 class MainWindow;
 }
 QT_END_NAMESPACE
+
+class QTableWidgetItem;
 
 class MainWindow : public QMainWindow
 {
@@ -85,6 +88,12 @@ private:
     void saveDomSnapshot(const RecorderRequest &request, const QJsonObject &result);
     void updateTrainInfoTable(const QJsonArray &trains);
     void clearTrainInfoTable();
+    void onTrainInfoItemChanged(QTableWidgetItem *item);
+    void startTrainRefreshMacro();
+    void stopTrainRefreshMacro(const QString &message = QString());
+    void updateSelectedTrainRefresh();
+    void refreshSelectedTrainPage();
+    bool hasReservableSelectedTrain() const;
     bool writeJsonFile(const QString &filePath, const QJsonObject &document) const;
     void appendSnapshotManifest(const QString &directory, const QJsonObject &entry) const;
     static QJsonObject redactDomSnapshot(QJsonObject snapshot);
@@ -100,6 +109,7 @@ private:
     QWebSocket m_cdpSocket;
     QWebSocket m_recorderSocket;
     QTimer m_cdpReadyTimer;
+    QTimer m_selectedTrainRefreshTimer;
     int m_cdpReadyAttempts = 0;
     bool m_startupRequestInFlight = false;
     KorailLoginStep m_korailLoginStep = KorailLoginStep::Idle;
@@ -117,5 +127,8 @@ private:
     QHash<QString, QString> m_targetToRecorderSession;
     QHash<int, RecorderRequest> m_recorderRequests;
     QString m_trainInfoSessionId;
+    QSet<QString> m_selectedTrainKeys;
+    bool m_trainRefreshMacroActive = false;
+    bool m_updatingTrainInfoTable = false;
 };
 #endif // MAINWINDOW_H

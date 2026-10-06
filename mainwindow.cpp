@@ -29,6 +29,30 @@ QString normalizedText(const QString &text)
     return result.trimmed();
 }
 
+QString trainSelectionKey(const QJsonObject &train)
+{
+    return QStringList {
+        train.value(QStringLiteral("trainType")).toString(),
+        train.value(QStringLiteral("trainNumber")).toString(),
+        train.value(QStringLiteral("departure")).toString(),
+        train.value(QStringLiteral("departureTime")).toString(),
+        train.value(QStringLiteral("arrival")).toString(),
+        train.value(QStringLiteral("arrivalTime")).toString()
+    }.join(QChar(0x1f));
+}
+
+bool isReservableSeatText(const QString &seatText)
+{
+    const QString text = normalizedText(seatText);
+    const bool indicatesReservation = text.contains(QStringLiteral("예매"))
+        || text.contains(QStringLiteral("예약"));
+    const bool indicatesUnavailability = text.contains(QStringLiteral("매진"))
+        || text.contains(QStringLiteral("없음"))
+        || text.contains(QStringLiteral("불가"))
+        || text.contains(QStringLiteral("대기"));
+    return indicatesReservation && !indicatesUnavailability;
+}
+
 QJsonArray trainInfoFromDomSnapshot(const QJsonObject &snapshot, bool *isTicketReservationPage)
 {
     if (isTicketReservationPage) {
@@ -221,6 +245,12 @@ MainWindow::MainWindow(QWidget *parent)
             this, &MainWindow::startKorailAutoLogin);
     connect(ui->pageRecordingButton, &QPushButton::clicked,
             this, &MainWindow::togglePageRecording);
+    connect(ui->trainInfoTableWidget, &QTableWidget::itemChanged,
+            this, &MainWindow::onTrainInfoItemChanged);
+    connect(ui->startTrainRefreshMacroButton, &QPushButton::clicked,
+            this, &MainWindow::startTrainRefreshMacro);
+    connect(ui->stopTrainRefreshMacroButton, &QPushButton::clicked,
+            this, [this]() { stopTrainRefreshMacro(tr("열차 예매 확인 매크로를 중지했습니다.")); });
 
     ui->snapshotDirectoryEdit->setText(defaultSnapshotDirectory());
     ui->trainInfoTableWidget->setColumnCount(10);
@@ -232,11 +262,24 @@ MainWindow::MainWindow(QWidget *parent)
     ui->trainInfoTableWidget->verticalHeader()->setVisible(false);
     ui->trainInfoTableWidget->setEditTriggers(QAbstractItemView::NoEditTriggers);
     ui->trainInfoTableWidget->setSelectionBehavior(QAbstractItemView::SelectRows);
-    ui->trainInfoGroupBox->setVisible(false);
+    ui->trainInfoGroupBox->setTitle(tr("열차 정보 (열차 조회 페이지 대기 중)"));
+    ui->trainInfoGroupBox->setVisible(true);
 
     m_cdpReadyTimer.setInterval(200);
     connect(&m_cdpReadyTimer, &QTimer::timeout,
             this, &MainWindow::checkStartedChromeEndpoint);
+    m_selectedTrainRefreshTimer.setSingleShot(true);
+    m_selectedTrainRefreshTimer.setInterval(
+        ui->macroRefreshIntervalSpinBox->value() * 1000);
+    connect(&m_selectedTrainRefreshTimer, &QTimer::timeout,
+            this, &MainWindow::refreshSelectedTrainPage);
+    connect(ui->macroRefreshIntervalSpinBox, &QSpinBox::valueChanged,
+            this, [this](int seconds) {
+                m_selectedTrainRefreshTimer.setInterval(seconds * 1000);
+                if (m_trainRefreshMacroActive && m_selectedTrainRefreshTimer.isActive()) {
+                    m_selectedTrainRefreshTimer.start();
+                }
+            });
     connect(&m_cdpSocket, &QWebSocket::connected,
             this, &MainWindow::onCdpSocketConnected);
     connect(&m_cdpSocket, &QWebSocket::textMessageReceived,
@@ -677,6 +720,9 @@ void MainWindow::startPageRecording()
                 && webSocketUrl.scheme() != QStringLiteral("wss"))) {
             m_pageRecordingRequested = false;
             ui->pageRecordingButton->setEnabled(true);
+            if (m_trainRefreshMacroActive) {
+                stopTrainRefreshMacro();
+            }
             showStatus(tr("페이지 기록용 CDP Chrome에 연결하지 못했습니다. 먼저 CDP용 Chrome을 시작하세요."),
                        true);
             return;
@@ -1161,6 +1207,7 @@ void MainWindow::capturePageSnapshot(const QString &sessionId)
 
 void MainWindow::updateTrainInfoTable(const QJsonArray &trains)
 {
+    m_updatingTrainInfoTable = true;
     ui->trainInfoTableWidget->setUpdatesEnabled(false);
     ui->trainInfoTableWidget->setRowCount(0);
 
@@ -1168,9 +1215,13 @@ void MainWindow::updateTrainInfoTable(const QJsonArray &trains)
         const QJsonObject train = value.toObject();
         const int row = ui->trainInfoTableWidget->rowCount();
         ui->trainInfoTableWidget->insertRow(row);
+        const QString selectionKey = trainSelectionKey(train);
         auto *selectionItem = new QTableWidgetItem;
         selectionItem->setFlags(selectionItem->flags() | Qt::ItemIsUserCheckable);
-        selectionItem->setCheckState(Qt::Unchecked);
+        selectionItem->setData(Qt::UserRole, selectionKey);
+        selectionItem->setCheckState(m_selectedTrainKeys.contains(selectionKey)
+                                         ? Qt::Checked
+                                         : Qt::Unchecked);
         selectionItem->setToolTip(tr("이 열차 선택"));
         ui->trainInfoTableWidget->setItem(row, 0, selectionItem);
         const QStringList columns {
@@ -1192,15 +1243,128 @@ void MainWindow::updateTrainInfoTable(const QJsonArray &trains)
     }
 
     ui->trainInfoTableWidget->setUpdatesEnabled(true);
+    m_updatingTrainInfoTable = false;
     ui->trainInfoGroupBox->setTitle(tr("열차 정보 (%1건)").arg(trains.size()));
     ui->trainInfoGroupBox->setVisible(true);
 }
 
 void MainWindow::clearTrainInfoTable()
 {
+    stopTrainRefreshMacro();
+    m_selectedTrainKeys.clear();
     m_trainInfoSessionId.clear();
     ui->trainInfoTableWidget->setRowCount(0);
-    ui->trainInfoGroupBox->setVisible(false);
+    ui->trainInfoGroupBox->setTitle(tr("열차 정보 (열차 조회 페이지 대기 중)"));
+    ui->trainInfoGroupBox->setVisible(true);
+}
+
+void MainWindow::onTrainInfoItemChanged(QTableWidgetItem *item)
+{
+    if (m_updatingTrainInfoTable || !item || item->column() != 0) {
+        return;
+    }
+
+    const QString selectionKey = item->data(Qt::UserRole).toString();
+    if (selectionKey.isEmpty()) {
+        return;
+    }
+
+    if (item->checkState() == Qt::Checked) {
+        m_selectedTrainKeys.insert(selectionKey);
+    } else {
+        m_selectedTrainKeys.remove(selectionKey);
+    }
+    updateSelectedTrainRefresh();
+}
+
+void MainWindow::startTrainRefreshMacro()
+{
+    m_trainRefreshMacroActive = true;
+    ui->startTrainRefreshMacroButton->setEnabled(false);
+    ui->stopTrainRefreshMacroButton->setEnabled(true);
+
+    if (!m_pageRecordingRequested && !m_pageRecordingActive) {
+        startPageRecording();
+        if (!m_pageRecordingRequested && !m_pageRecordingActive) {
+            stopTrainRefreshMacro();
+        }
+        return;
+    }
+    updateSelectedTrainRefresh();
+}
+
+void MainWindow::stopTrainRefreshMacro(const QString &message)
+{
+    const bool wasActive = m_trainRefreshMacroActive;
+    m_trainRefreshMacroActive = false;
+    m_selectedTrainRefreshTimer.stop();
+    ui->startTrainRefreshMacroButton->setEnabled(true);
+    ui->stopTrainRefreshMacroButton->setEnabled(false);
+    if (wasActive && !message.isEmpty()) {
+        showStatus(message);
+    }
+}
+
+void MainWindow::updateSelectedTrainRefresh()
+{
+    if (!m_trainRefreshMacroActive) {
+        m_selectedTrainRefreshTimer.stop();
+        return;
+    }
+    if (m_selectedTrainKeys.isEmpty()) {
+        m_selectedTrainRefreshTimer.stop();
+        showStatus(tr("매크로가 준비되었습니다. 예매 가능 여부를 확인할 열차를 선택하세요."));
+        return;
+    }
+    if (hasReservableSelectedTrain()) {
+        stopTrainRefreshMacro(tr("선택한 열차에서 예매 가능한 좌석을 찾았습니다."));
+        return;
+    }
+    if (!m_pageRecordingActive || m_trainInfoSessionId.isEmpty()
+        || !m_recorderSessions.contains(m_trainInfoSessionId)) {
+        return;
+    }
+    if (!m_selectedTrainRefreshTimer.isActive()) {
+        showStatus(tr("선택한 열차의 예매 가능 여부를 확인 중입니다. %1초 후 페이지를 새로고침합니다.")
+                       .arg(ui->macroRefreshIntervalSpinBox->value()));
+        m_selectedTrainRefreshTimer.start();
+    }
+}
+
+void MainWindow::refreshSelectedTrainPage()
+{
+    if (!m_trainRefreshMacroActive || m_selectedTrainKeys.isEmpty()
+        || hasReservableSelectedTrain()) {
+        return;
+    }
+    if (!m_pageRecordingActive || m_trainInfoSessionId.isEmpty()
+        || !m_recorderSessions.contains(m_trainInfoSessionId)) {
+        return;
+    }
+    if (sendRecorderCommand(QStringLiteral("Page.reload"), {}, m_trainInfoSessionId) == 0) {
+        stopTrainRefreshMacro();
+        showStatus(tr("선택한 열차 정보를 새로고침하지 못했습니다."), true);
+        return;
+    }
+    showStatus(tr("선택한 열차의 예매 가능 여부를 다시 확인하기 위해 페이지를 새로고침했습니다."));
+}
+
+bool MainWindow::hasReservableSelectedTrain() const
+{
+    for (int row = 0; row < ui->trainInfoTableWidget->rowCount(); ++row) {
+        const QTableWidgetItem *selectionItem = ui->trainInfoTableWidget->item(row, 0);
+        if (!selectionItem || selectionItem->checkState() != Qt::Checked) {
+            continue;
+        }
+
+        const QTableWidgetItem *generalSeatItem = ui->trainInfoTableWidget->item(row, 8);
+        const QTableWidgetItem *specialSeatItem = ui->trainInfoTableWidget->item(row, 9);
+        if ((generalSeatItem && isReservableSeatText(generalSeatItem->text()))
+            || (specialSeatItem && isReservableSeatText(specialSeatItem->text()))) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void MainWindow::saveDomSnapshot(const RecorderRequest &request, const QJsonObject &result)
@@ -1242,6 +1406,9 @@ void MainWindow::saveDomSnapshot(const RecorderRequest &request, const QJsonObje
                             {QStringLiteral("domSnapshotFile"),
                              QDir(request.captureId).filePath(QStringLiteral("dom-snapshot.json"))}});
     showStatus(tr("DOM 스냅샷을 저장했습니다: %1").arg(session.title));
+    if (isTicketReservationPage) {
+        updateSelectedTrainRefresh();
+    }
 }
 
 bool MainWindow::writeJsonFile(const QString &filePath, const QJsonObject &document) const

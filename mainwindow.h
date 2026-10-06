@@ -59,6 +59,7 @@ private:
         QString captureId;
         QString captureDirectory;
         QString sessionId;
+        bool saveSnapshot = false;
     };
 
     void startChromeForCdp();
@@ -75,6 +76,10 @@ private:
     void togglePageRecording();
     void startPageRecording();
     void stopPageRecording(const QString &message = QString());
+    void startTrainInfoMonitoring();
+    bool startRecorderConnection();
+    bool isRecorderRequested() const;
+    bool isRecorderActive() const;
     void onRecorderSocketConnected();
     void onRecorderTextMessageReceived(const QString &message);
     void onRecorderSocketDisconnected();
@@ -121,6 +126,8 @@ private:
     QString m_cdpSessionId;
     bool m_pageRecordingRequested = false;
     bool m_pageRecordingActive = false;
+    bool m_trainInfoMonitoringRequested = false;
+    bool m_trainInfoMonitoringActive = false;
     int m_nextRecorderCommandId = 1;
     int m_nextSnapshotSequence = 1;
     QHash<QString, RecorderSession> m_recorderSessions;

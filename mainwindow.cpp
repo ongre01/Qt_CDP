@@ -385,6 +385,7 @@ void MainWindow::checkStartedChromeEndpoint()
         m_cdpReadyTimer.stop();
         setBusy(false);
         showStatus(tr("CDP용 Chrome이 준비되었습니다. Qt에서 CDP 제어를 시작할 수 있습니다."));
+        startTrainInfoMonitoring();
     });
 }
 
@@ -411,6 +412,7 @@ void MainWindow::startKorailAutoLogin()
         return;
     }
 
+    startTrainInfoMonitoring();
     m_korailLoginInProgress = true;
     m_korailLoginStep = KorailLoginStep::Idle;
     m_pendingCdpCommandId = 0;
@@ -678,29 +680,62 @@ void MainWindow::togglePageRecording()
 void MainWindow::startPageRecording()
 {
     const QString snapshotDirectory = ui->snapshotDirectoryEdit->text().trimmed();
-    QString errorMessage;
-    const QUrl versionUrl = debuggerVersionUrl(&errorMessage);
 
     if (snapshotDirectory.isEmpty()) {
         showStatus(tr("스냅샷 저장 폴더를 입력하세요."), true);
-        return;
-    }
-    if (!versionUrl.isValid()) {
-        showStatus(errorMessage, true);
-        return;
-    }
-    if (!isLocalCdpHost(versionUrl.host())) {
-        showStatus(tr("방문 페이지 기록은 로컬 CDP 주소에서만 지원합니다."), true);
         return;
     }
     if (!QDir().mkpath(snapshotDirectory)) {
         showStatus(tr("스냅샷 저장 폴더를 만들 수 없습니다."), true);
         return;
     }
+    if (m_pageRecordingRequested || m_pageRecordingActive) {
+        return;
+    }
 
     m_pageRecordingRequested = true;
     ui->pageRecordingButton->setEnabled(false);
-    showStatus(tr("방문 페이지 기록용 CDP 연결을 준비하는 중입니다..."));
+    if (m_trainInfoMonitoringActive) {
+        m_pageRecordingActive = true;
+        ui->pageRecordingButton->setEnabled(true);
+        ui->pageRecordingButton->setText(tr("방문 페이지 기록 중지"));
+        showStatus(tr("방문 페이지 스냅샷 저장을 시작했습니다."));
+        return;
+    }
+    if (m_trainInfoMonitoringRequested) {
+        showStatus(tr("방문 페이지 기록용 CDP 연결을 준비하는 중입니다..."));
+        return;
+    }
+    if (!startRecorderConnection()) {
+        m_pageRecordingRequested = false;
+        ui->pageRecordingButton->setEnabled(true);
+    }
+}
+
+void MainWindow::startTrainInfoMonitoring()
+{
+    if (isRecorderRequested() || isRecorderActive()) {
+        return;
+    }
+
+    m_trainInfoMonitoringRequested = true;
+    if (!startRecorderConnection()) {
+        m_trainInfoMonitoringRequested = false;
+    }
+}
+
+bool MainWindow::startRecorderConnection()
+{
+    QString errorMessage;
+    const QUrl versionUrl = debuggerVersionUrl(&errorMessage);
+    if (!versionUrl.isValid()) {
+        showStatus(errorMessage, true);
+        return false;
+    }
+    if (!isLocalCdpHost(versionUrl.host())) {
+        showStatus(tr("열차 정보 수집은 로컬 CDP 주소에서만 지원합니다."), true);
+        return false;
+    }
 
     QNetworkReply *reply = m_networkManager.get(QNetworkRequest(versionUrl));
     connect(reply, &QNetworkReply::finished, this, [this, reply]() {
@@ -712,24 +747,36 @@ void MainWindow::startPageRecording()
         const QUrl webSocketUrl(document.object()
                                     .value(QStringLiteral("webSocketDebuggerUrl"))
                                     .toString());
-        if (!m_pageRecordingRequested) {
+        if (!isRecorderRequested()) {
             return;
         }
         if (!requestSucceeded || !webSocketUrl.isValid()
             || (webSocketUrl.scheme() != QStringLiteral("ws")
                 && webSocketUrl.scheme() != QStringLiteral("wss"))) {
             m_pageRecordingRequested = false;
+            m_trainInfoMonitoringRequested = false;
             ui->pageRecordingButton->setEnabled(true);
             if (m_trainRefreshMacroActive) {
                 stopTrainRefreshMacro();
             }
-            showStatus(tr("페이지 기록용 CDP Chrome에 연결하지 못했습니다. 먼저 CDP용 Chrome을 시작하세요."),
+            showStatus(tr("열차 정보 수집용 CDP Chrome에 연결하지 못했습니다. 먼저 CDP용 Chrome을 시작하세요."),
                        true);
             return;
         }
 
         m_recorderSocket.open(webSocketUrl);
     });
+    return true;
+}
+
+bool MainWindow::isRecorderRequested() const
+{
+    return m_pageRecordingRequested || m_trainInfoMonitoringRequested;
+}
+
+bool MainWindow::isRecorderActive() const
+{
+    return m_pageRecordingActive || m_trainInfoMonitoringActive;
 }
 
 void MainWindow::stopPageRecording(const QString &message)
@@ -737,12 +784,20 @@ void MainWindow::stopPageRecording(const QString &message)
     const bool wasRecording = m_pageRecordingRequested || m_pageRecordingActive;
     m_pageRecordingRequested = false;
     m_pageRecordingActive = false;
+    ui->pageRecordingButton->setEnabled(true);
+    ui->pageRecordingButton->setText(tr("방문 페이지 기록 시작"));
+
+    if (m_trainInfoMonitoringRequested || m_trainInfoMonitoringActive) {
+        if (wasRecording && !message.isEmpty()) {
+            showStatus(message);
+        }
+        return;
+    }
+
     m_recorderRequests.clear();
     m_recorderSessions.clear();
     m_targetToRecorderSession.clear();
     clearTrainInfoTable();
-    ui->pageRecordingButton->setEnabled(true);
-    ui->pageRecordingButton->setText(tr("방문 페이지 기록 시작"));
 
     if (m_recorderSocket.state() != QAbstractSocket::UnconnectedState) {
         m_recorderSocket.close();
@@ -754,14 +809,19 @@ void MainWindow::stopPageRecording(const QString &message)
 
 void MainWindow::onRecorderSocketConnected()
 {
-    if (!m_pageRecordingRequested) {
+    if (!isRecorderRequested()) {
         m_recorderSocket.close();
         return;
     }
 
-    m_pageRecordingActive = true;
-    ui->pageRecordingButton->setEnabled(true);
-    ui->pageRecordingButton->setText(tr("방문 페이지 기록 중지"));
+    if (m_pageRecordingRequested) {
+        m_pageRecordingActive = true;
+        ui->pageRecordingButton->setEnabled(true);
+        ui->pageRecordingButton->setText(tr("방문 페이지 기록 중지"));
+    }
+    if (m_trainInfoMonitoringRequested) {
+        m_trainInfoMonitoringActive = true;
+    }
 
     sendRecorderCommand(QStringLiteral("Target.setDiscoverTargets"),
                         {{QStringLiteral("discover"), true}});
@@ -774,10 +834,12 @@ void MainWindow::onRecorderSocketConnected()
 
     const int commandId = sendRecorderCommand(QStringLiteral("Target.getTargets"));
     if (commandId != 0) {
-        m_recorderRequests.insert(commandId, {RecorderRequestType::TargetList, {}, {}, {}});
+        m_recorderRequests.insert(commandId, {RecorderRequestType::TargetList, {}, {}, {}, false});
     }
 
-    showStatus(tr("방문 페이지 기록 중입니다. 입력값과 textarea 값은 저장하지 않습니다."));
+    showStatus(m_pageRecordingActive
+                   ? tr("방문 페이지 기록 중입니다. 입력값과 textarea 값은 저장하지 않습니다.")
+                   : tr("열차 정보 수집 중입니다. 열차 조회 페이지를 열면 목록을 표시합니다."));
 }
 
 void MainWindow::onRecorderTextMessageReceived(const QString &message)
@@ -835,9 +897,11 @@ void MainWindow::onRecorderTextMessageReceived(const QString &message)
 
 void MainWindow::onRecorderSocketDisconnected()
 {
-    const bool wasRecording = m_pageRecordingRequested || m_pageRecordingActive;
+    const bool wasRecording = isRecorderRequested() || isRecorderActive();
     m_pageRecordingActive = false;
     m_pageRecordingRequested = false;
+    m_trainInfoMonitoringActive = false;
+    m_trainInfoMonitoringRequested = false;
     m_recorderRequests.clear();
     m_recorderSessions.clear();
     m_targetToRecorderSession.clear();
@@ -846,7 +910,7 @@ void MainWindow::onRecorderSocketDisconnected()
     ui->pageRecordingButton->setText(tr("방문 페이지 기록 시작"));
 
     if (wasRecording) {
-        showStatus(tr("페이지 기록용 CDP 연결이 끊어졌습니다."), true);
+        showStatus(tr("열차 정보 수집용 CDP 연결이 끊어졌습니다."), true);
     }
 }
 
@@ -877,7 +941,7 @@ int MainWindow::sendRecorderCommand(const QString &method,
 
 void MainWindow::handleRecorderEvent(const QJsonObject &event)
 {
-    if (!m_pageRecordingActive) {
+    if (!isRecorderActive()) {
         return;
     }
 
@@ -954,7 +1018,7 @@ void MainWindow::attachRecorderToPage(const QJsonObject &parameters)
 
 void MainWindow::schedulePageSnapshot(const QString &sessionId, int delayMilliseconds)
 {
-    if (!m_pageRecordingActive || !m_recorderSessions.contains(sessionId)) {
+    if (!isRecorderActive() || !m_recorderSessions.contains(sessionId)) {
         return;
     }
 
@@ -968,7 +1032,7 @@ void MainWindow::schedulePageSnapshot(const QString &sessionId, int delayMillise
 
     session.captureScheduled = true;
     QTimer::singleShot(delayMilliseconds, this, [this, sessionId]() {
-        if (!m_pageRecordingActive || !m_recorderSessions.contains(sessionId)) {
+        if (!isRecorderActive() || !m_recorderSessions.contains(sessionId)) {
             return;
         }
 
@@ -979,7 +1043,7 @@ void MainWindow::schedulePageSnapshot(const QString &sessionId, int delayMillise
 
 void MainWindow::capturePageSnapshot(const QString &sessionId)
 {
-    if (!m_pageRecordingActive || !m_recorderSessions.contains(sessionId)) {
+    if (!isRecorderActive() || !m_recorderSessions.contains(sessionId)) {
         return;
     }
 
@@ -988,13 +1052,18 @@ void MainWindow::capturePageSnapshot(const QString &sessionId)
         return;
     }
 
-    const QString snapshotDirectory = ui->snapshotDirectoryEdit->text().trimmed();
-    const QString captureId = QDateTime::currentDateTimeUtc().toString(QStringLiteral("yyyyMMddTHHmmsszzzZ"))
-                              + QStringLiteral("-%1").arg(m_nextSnapshotSequence++);
-    const QString captureDirectory = QDir(snapshotDirectory).filePath(captureId);
-    if (!QDir().mkpath(captureDirectory)) {
-        showStatus(tr("페이지 스냅샷 폴더를 만들 수 없습니다."), true);
-        return;
+    const bool saveSnapshot = m_pageRecordingActive;
+    QString captureId;
+    QString captureDirectory;
+    if (saveSnapshot) {
+        const QString snapshotDirectory = ui->snapshotDirectoryEdit->text().trimmed();
+        captureId = QDateTime::currentDateTimeUtc().toString(QStringLiteral("yyyyMMddTHHmmsszzzZ"))
+                    + QStringLiteral("-%1").arg(m_nextSnapshotSequence++);
+        captureDirectory = QDir(snapshotDirectory).filePath(captureId);
+        if (!QDir().mkpath(captureDirectory)) {
+            showStatus(tr("페이지 스냅샷 폴더를 만들 수 없습니다."), true);
+            return;
+        }
     }
 
     session.captureInFlight = true;
@@ -1007,7 +1076,8 @@ void MainWindow::capturePageSnapshot(const QString &sessionId)
         return;
     }
     m_recorderRequests.insert(domSnapshotCommandId,
-                              {RecorderRequestType::DomSnapshot, captureId, captureDirectory, sessionId});
+                              {RecorderRequestType::DomSnapshot, captureId, captureDirectory, sessionId,
+                               saveSnapshot});
     return;
 
 #if 0 // Replaced by the passive DOMSnapshot path above; retained temporarily for source comparison.
@@ -1283,11 +1353,9 @@ void MainWindow::startTrainRefreshMacro()
     ui->startTrainRefreshMacroButton->setEnabled(false);
     ui->stopTrainRefreshMacroButton->setEnabled(true);
 
-    if (!m_pageRecordingRequested && !m_pageRecordingActive) {
-        startPageRecording();
-        if (!m_pageRecordingRequested && !m_pageRecordingActive) {
-            stopTrainRefreshMacro();
-        }
+    startTrainInfoMonitoring();
+    if (!isRecorderRequested() && !isRecorderActive()) {
+        stopTrainRefreshMacro();
         return;
     }
     updateSelectedTrainRefresh();
@@ -1320,7 +1388,7 @@ void MainWindow::updateSelectedTrainRefresh()
         stopTrainRefreshMacro(tr("선택한 열차에서 예매 가능한 좌석을 찾았습니다."));
         return;
     }
-    if (!m_pageRecordingActive || m_trainInfoSessionId.isEmpty()
+    if (!isRecorderActive() || m_trainInfoSessionId.isEmpty()
         || !m_recorderSessions.contains(m_trainInfoSessionId)) {
         return;
     }
@@ -1337,7 +1405,7 @@ void MainWindow::refreshSelectedTrainPage()
         || hasReservableSelectedTrain()) {
         return;
     }
-    if (!m_pageRecordingActive || m_trainInfoSessionId.isEmpty()
+    if (!isRecorderActive() || m_trainInfoSessionId.isEmpty()
         || !m_recorderSessions.contains(m_trainInfoSessionId)) {
         return;
     }
@@ -1380,6 +1448,13 @@ void MainWindow::saveDomSnapshot(const RecorderRequest &request, const QJsonObje
         updateTrainInfoTable(trains);
     } else if (request.sessionId == m_trainInfoSessionId) {
         clearTrainInfoTable();
+    }
+
+    if (!request.saveSnapshot) {
+        if (isTicketReservationPage) {
+            updateSelectedTrainRefresh();
+        }
+        return;
     }
 
     const QJsonObject redactedSnapshot = redactDomSnapshot(result);

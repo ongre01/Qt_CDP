@@ -12,6 +12,7 @@
 #include <QDesktopServices>
 #include <QDir>
 #include <QHeaderView>
+#include <QSettings>
 #include <QTableWidgetItem>
 #include <QUrl>
 
@@ -27,6 +28,12 @@ MainWindow::MainWindow(QWidget *parent)
     , m_autoBookingController(new AutoBookingController(m_recorderCdpClient, m_pageRecorder, this))
 {
     ui->setupUi(this);
+    QSettings settings(QSettings::IniFormat, QSettings::UserScope,
+                       QStringLiteral("Qt_CDP"), QStringLiteral("Qt_CDP"));
+    settings.beginGroup(QStringLiteral("KorailLogin"));
+    ui->memberNumberEdit->setText(settings.value(QStringLiteral("memberNumber")).toString());
+    ui->korailPasswordEdit->setText(settings.value(QStringLiteral("password")).toString());
+    settings.endGroup();
     ui->snapshotDirectoryEdit->setText(SnapshotStorage::defaultDirectory());
     ui->trainInfoTableWidget->setColumnCount(10);
     ui->trainInfoTableWidget->setHorizontalHeaderLabels(
@@ -147,6 +154,19 @@ void MainWindow::startKorailAutoLogin()
     if (m_authController->isLoggingIn()) {
         return;
     }
+
+    QSettings settings(QSettings::IniFormat, QSettings::UserScope,
+                       QStringLiteral("Qt_CDP"), QStringLiteral("Qt_CDP"));
+    settings.beginGroup(QStringLiteral("KorailLogin"));
+    settings.setValue(QStringLiteral("memberNumber"), memberNumber);
+    settings.setValue(QStringLiteral("password"), password);
+    settings.endGroup();
+    settings.sync();
+    if (settings.status() != QSettings::NoError) {
+        showStatus(tr("코레일 로그인 정보를 INI 파일에 저장하지 못했습니다."), true);
+        return;
+    }
+
     startTrainInfoMonitoring();
     m_authController->login(memberNumber, password, versionUrl);
 }

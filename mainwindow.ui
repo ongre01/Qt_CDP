@@ -116,7 +116,7 @@
     <item>
      <widget class="QGroupBox" name="trainRefreshMacroGroupBox">
       <property name="title">
-       <string>열차 예매 확인 매크로</string>
+       <string>병렬 다중 탭 예매 매크로</string>
       </property>
       <layout class="QHBoxLayout" name="trainRefreshMacroLayout">
        <item>
@@ -145,7 +145,7 @@
        <item>
         <widget class="QCheckBox" name="autoBookWhenAvailableCheckBox">
          <property name="toolTip">
-          <string>선택 열차에서 예매 가능한 좌석을 찾으면 예매 버튼을 자동으로 누릅니다.</string>
+          <string>각 조회 탭에서 선택 열차의 예매 가능한 좌석을 찾으면, 해당 탭의 예매 버튼을 동시에 자동으로 누릅니다.</string>
          </property>
          <property name="text">
           <string>가능 시 자동 예매</string>
@@ -156,19 +156,19 @@
         </widget>
        </item>
        <item>
-        <widget class="QPushButton" name="startTrainRefreshMacroButton">
+       <widget class="QPushButton" name="startTrainRefreshMacroButton">
          <property name="text">
-          <string>매크로 시작</string>
+          <string>병렬 매크로 시작</string>
          </property>
         </widget>
        </item>
        <item>
-        <widget class="QPushButton" name="stopTrainRefreshMacroButton">
+       <widget class="QPushButton" name="stopTrainRefreshMacroButton">
          <property name="enabled">
           <bool>false</bool>
          </property>
          <property name="text">
-          <string>매크로 중지</string>
+          <string>병렬 매크로 중지</string>
          </property>
         </widget>
        </item>
@@ -195,12 +195,12 @@
       </property>
       <layout class="QVBoxLayout" name="trainInfoLayout">
        <item>
-        <widget class="QTableWidget" name="trainInfoTableWidget">
-         <property name="alternatingRowColors">
+        <widget class="QTabWidget" name="trainInfoTabWidget">
+         <property name="documentMode">
           <bool>true</bool>
          </property>
-         <property name="selectionMode">
-          <enum>QAbstractItemView::SelectionMode::SingleSelection</enum>
+         <property name="usesScrollButtons">
+          <bool>true</bool>
          </property>
         </widget>
        </item>

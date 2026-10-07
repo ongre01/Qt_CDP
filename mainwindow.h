@@ -2,6 +2,7 @@
 #define MAINWINDOW_H
 
 #include <QMainWindow>
+#include <QHash>
 #include <QList>
 #include <QSet>
 
@@ -19,6 +20,7 @@ class KorailAuthController;
 class PageRecorder;
 class QJsonObject;
 class QNetworkAccessManager;
+class QTableWidget;
 class QTableWidgetItem;
 class SnapshotStorage;
 
@@ -31,6 +33,13 @@ public:
     ~MainWindow() override;
 
 private:
+    struct TrainInfoTab {
+        int number = 0;
+        QList<TrainInfo> trains;
+        AutoBookingController *controller = nullptr;
+        QTableWidget *table = nullptr;
+    };
+
     void startChromeForCdp();
     void startKorailAutoLogin();
     void togglePageRecording();
@@ -39,10 +48,17 @@ private:
     void startTrainRefreshMacro();
     void stopTrainRefreshMacro(const QString &message = QString());
     void onDomSnapshotCaptured(const QJsonObject &snapshot, const QString &sessionId);
-    void updateTrainInfoTable(const QList<TrainInfo> &trains);
+    void updateTrainInfoTable();
     void clearTrainInfoTable();
-    void onTrainInfoItemChanged(QTableWidgetItem *item);
-    QList<TrainInfo> selectedTrains() const;
+    void removeTrainInfoTab(const QString &sessionId);
+    void onTrainInfoItemChanged(const QString &sessionId, QTableWidgetItem *item);
+    QList<TrainInfo> selectedTrains(const QString &sessionId) const;
+    QString trainSelectionKey(const QString &sessionId, const TrainInfo &train) const;
+    QTableWidget *createTrainInfoTable(const QString &sessionId);
+    AutoBookingController *createAutoBookingController(const QString &sessionId,
+                                                       const QString &label);
+    void updateTrainRefreshMacroUi();
+    void sendBookingNotification(const QString &tab);
     void updatePageRecordingUi(bool active);
     void setBusy(bool busy);
     void showStatus(const QString &message, bool isError = false);
@@ -54,11 +70,11 @@ private:
     SnapshotStorage *m_snapshotStorage;
     KorailAuthController *m_authController;
     PageRecorder *m_pageRecorder;
-    AutoBookingController *m_autoBookingController;
     QNetworkAccessManager *m_notificationNetworkManager;
-    QList<TrainInfo> m_currentTrains;
+    QHash<QString, TrainInfoTab> m_trainInfoTabs;
     QSet<QString> m_selectedTrainKeys;
-    QString m_trainInfoSessionId;
+    int m_nextTrainInfoTabNumber = 1;
+    bool m_trainRefreshMacroRunning = false;
     bool m_updatingTrainInfoTable = false;
 };
 

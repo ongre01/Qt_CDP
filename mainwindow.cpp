@@ -17,6 +17,7 @@
 #include <QNetworkRequest>
 #include <QSettings>
 #include <QTableWidgetItem>
+#include <QTabWidget>
 #include <QUrl>
 
 MainWindow::MainWindow(QWidget *parent)
@@ -28,7 +29,6 @@ MainWindow::MainWindow(QWidget *parent)
     , m_snapshotStorage(new SnapshotStorage)
     , m_authController(new KorailAuthController(m_authCdpClient, this))
     , m_pageRecorder(new PageRecorder(m_recorderCdpClient, m_snapshotStorage, this))
-    , m_autoBookingController(new AutoBookingController(m_recorderCdpClient, m_pageRecorder, this))
     , m_notificationNetworkManager(new QNetworkAccessManager(this))
 {
     ui->setupUi(this);
@@ -39,15 +39,6 @@ MainWindow::MainWindow(QWidget *parent)
     ui->korailPasswordEdit->setText(settings.value(QStringLiteral("password")).toString());
     settings.endGroup();
     ui->snapshotDirectoryEdit->setText(SnapshotStorage::defaultDirectory());
-    ui->trainInfoTableWidget->setColumnCount(10);
-    ui->trainInfoTableWidget->setHorizontalHeaderLabels(
-        {tr("선택"), tr("열차"), tr("번호"), tr("출발역"), tr("출발 시각"),
-         tr("도착역"), tr("도착 시각"), tr("소요 시간"), tr("일반실"), tr("특실")});
-    ui->trainInfoTableWidget->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
-    ui->trainInfoTableWidget->horizontalHeader()->setStretchLastSection(true);
-    ui->trainInfoTableWidget->verticalHeader()->setVisible(false);
-    ui->trainInfoTableWidget->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    ui->trainInfoTableWidget->setSelectionBehavior(QAbstractItemView::SelectRows);
     ui->trainInfoGroupBox->setTitle(tr("열차 정보 (열차 조회 페이지 대기 중)"));
     ui->trainInfoGroupBox->setVisible(true);
 
@@ -55,18 +46,22 @@ MainWindow::MainWindow(QWidget *parent)
     connect(ui->korailAutoLoginButton, &QPushButton::clicked, this, &MainWindow::startKorailAutoLogin);
     connect(ui->pageRecordingButton, &QPushButton::clicked, this, &MainWindow::togglePageRecording);
     connect(ui->openSnapshotDirectoryButton, &QPushButton::clicked, this, &MainWindow::openSnapshotDirectory);
-    connect(ui->trainInfoTableWidget, &QTableWidget::itemChanged, this, &MainWindow::onTrainInfoItemChanged);
     connect(ui->startTrainRefreshMacroButton, &QPushButton::clicked, this, &MainWindow::startTrainRefreshMacro);
     connect(ui->stopTrainRefreshMacroButton, &QPushButton::clicked, this, [this]() {
         stopTrainRefreshMacro(tr("열차 예매 확인 매크로를 중지했습니다."));
     });
     connect(ui->macroRefreshIntervalSpinBox, &QSpinBox::valueChanged, this,
-            [this](int seconds) { m_autoBookingController->setRefreshIntervalSeconds(seconds); });
+            [this](int seconds) {
+                for (const TrainInfoTab &tab : m_trainInfoTabs) {
+                    tab.controller->setRefreshIntervalSeconds(seconds);
+                }
+            });
     connect(ui->autoBookWhenAvailableCheckBox, &QCheckBox::toggled, this,
-            [this](bool enabled) { m_autoBookingController->setAutoBookWhenAvailable(enabled); });
-
-    m_autoBookingController->setRefreshIntervalSeconds(ui->macroRefreshIntervalSpinBox->value());
-    m_autoBookingController->setAutoBookWhenAvailable(ui->autoBookWhenAvailableCheckBox->isChecked());
+            [this](bool enabled) {
+                for (const TrainInfoTab &tab : m_trainInfoTabs) {
+                    tab.controller->setAutoBookWhenAvailable(enabled);
+                }
+            });
 
     connect(m_startupCdpClient, &CdpClient::chromeStarted, this, [this](qint64 processId) {
         setBusy(true);
@@ -97,9 +92,7 @@ MainWindow::MainWindow(QWidget *parent)
     connect(m_pageRecorder, &PageRecorder::pageRecordingChanged, this, &MainWindow::updatePageRecordingUi);
     connect(m_pageRecorder, &PageRecorder::snapshotCaptured, this, &MainWindow::onDomSnapshotCaptured);
     connect(m_pageRecorder, &PageRecorder::pageDetached, this, [this](const QString &sessionId) {
-        if (sessionId == m_trainInfoSessionId) {
-            clearTrainInfoTable();
-        }
+        removeTrainInfoTab(sessionId);
     });
     connect(m_pageRecorder, &PageRecorder::monitoringStopped, this, &MainWindow::clearTrainInfoTable);
     connect(m_pageRecorder, &PageRecorder::statusChanged, this,
@@ -107,36 +100,7 @@ MainWindow::MainWindow(QWidget *parent)
     connect(m_pageRecorder, &PageRecorder::errorOccurred, this,
             [this](const QString &message) { showStatus(message, true); });
 
-    connect(m_autoBookingController, &AutoBookingController::runningChanged, this, [this](bool running) {
-        ui->startTrainRefreshMacroButton->setEnabled(!running);
-        ui->stopTrainRefreshMacroButton->setEnabled(running);
-    });
-    connect(m_autoBookingController, &AutoBookingController::statusChanged, this,
-            [this](const QString &message) { showStatus(message); });
-    connect(m_autoBookingController, &AutoBookingController::bookingFailed, this,
-            [this](const QString &message) { showStatus(message, true); });
-    connect(m_autoBookingController, &AutoBookingController::bookingSucceeded, this, [this]() {
-        QNetworkRequest request(QUrl(QStringLiteral("https://ntfy.sh/ktx")));
-        request.setHeader(QNetworkRequest::ContentTypeHeader,
-                          QStringLiteral("text/plain; charset=utf-8"));
-        request.setAttribute(QNetworkRequest::Http2AllowedAttribute, false);
-        request.setRawHeader("Title", QStringLiteral("KTX 예매 완료").toUtf8());
-        request.setRawHeader("Priority", "high");
-
-        QNetworkReply *reply = m_notificationNetworkManager->post(
-            request, QStringLiteral("KTX 예매가 완료되었습니다.").toUtf8());
-        connect(reply, &QNetworkReply::finished, this, [this, reply]() {
-            const int statusCode = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
-            if (reply->error() != QNetworkReply::NoError || statusCode < 200 || statusCode >= 300) {
-                showStatus(tr("ntfy 예매 완료 알림을 전송하지 못했습니다: %1")
-                               .arg(reply->errorString()), true);
-            } else {
-                showStatus(tr("ntfy 예매 완료 알림을 전송했습니다 (HTTP %1).")
-                               .arg(statusCode));
-            }
-            reply->deleteLater();
-        });
-    });
+    updateTrainRefreshMacroUi();
 }
 
 MainWindow::~MainWindow()
@@ -255,13 +219,29 @@ void MainWindow::startTrainInfoMonitoring()
 void MainWindow::startTrainRefreshMacro()
 {
     startTrainInfoMonitoring();
-    m_autoBookingController->start();
+    if (m_trainRefreshMacroRunning) {
+        return;
+    }
+
+    m_trainRefreshMacroRunning = true;
+    for (const TrainInfoTab &tab : m_trainInfoTabs) {
+        tab.controller->start();
+    }
+    updateTrainRefreshMacroUi();
+
+    if (m_trainInfoTabs.isEmpty()) {
+        showStatus(tr("병렬 예매 매크로가 준비되었습니다. 코레일 열차 조회 탭을 하나 이상 여세요."));
+    }
 }
 
 void MainWindow::stopTrainRefreshMacro(const QString &message)
 {
-    const bool wasRunning = m_autoBookingController->isRunning();
-    m_autoBookingController->stop();
+    const bool wasRunning = m_trainRefreshMacroRunning;
+    m_trainRefreshMacroRunning = false;
+    for (const TrainInfoTab &tab : m_trainInfoTabs) {
+        tab.controller->stop();
+    }
+    updateTrainRefreshMacroUi();
     if (wasRunning && !message.isEmpty()) {
         showStatus(message);
     }
@@ -272,61 +252,115 @@ void MainWindow::onDomSnapshotCaptured(const QJsonObject &snapshot, const QStrin
     bool isTicketReservationPage = false;
     const QList<TrainInfo> trains = TrainInfoParser::parse(snapshot, &isTicketReservationPage);
     if (isTicketReservationPage) {
-        m_trainInfoSessionId = sessionId;
-        if (trains.isEmpty() && m_autoBookingController->isRunning() && !m_currentTrains.isEmpty()) {
+        if (sessionId.isEmpty()) {
             return;
         }
-        updateTrainInfoTable(trains);
-        m_autoBookingController->setTrainInfoContext(sessionId, selectedTrains());
-    } else if (sessionId == m_trainInfoSessionId && !m_autoBookingController->isRunning()) {
-        clearTrainInfoTable();
+        if (!m_trainInfoTabs.contains(sessionId)) {
+            const QString label = tr("탭 %1").arg(m_nextTrainInfoTabNumber++);
+            TrainInfoTab tab;
+            tab.number = m_nextTrainInfoTabNumber - 1;
+            tab.controller = createAutoBookingController(sessionId, label);
+            tab.table = createTrainInfoTable(sessionId);
+            ui->trainInfoTabWidget->addTab(tab.table, label);
+            m_trainInfoTabs.insert(sessionId, tab);
+        }
+
+        TrainInfoTab &tab = m_trainInfoTabs[sessionId];
+        if (trains.isEmpty() && m_trainRefreshMacroRunning && !tab.trains.isEmpty()) {
+            return;
+        }
+        tab.trains = trains;
+        tab.controller->setTrainInfoContext(sessionId, selectedTrains(sessionId));
+        if (m_trainRefreshMacroRunning) {
+            tab.controller->start();
+        }
+        updateTrainInfoTable();
+    } else if (!m_trainRefreshMacroRunning) {
+        removeTrainInfoTab(sessionId);
     }
 }
 
-void MainWindow::updateTrainInfoTable(const QList<TrainInfo> &trains)
+void MainWindow::updateTrainInfoTable()
 {
-    m_currentTrains = trains;
     m_updatingTrainInfoTable = true;
-    ui->trainInfoTableWidget->setUpdatesEnabled(false);
-    ui->trainInfoTableWidget->setRowCount(0);
-    for (const TrainInfo &train : trains) {
-        const int row = ui->trainInfoTableWidget->rowCount();
-        ui->trainInfoTableWidget->insertRow(row);
-        const QString selectionKey = TrainInfoParser::selectionKey(train);
-        auto *selectionItem = new QTableWidgetItem;
-        selectionItem->setFlags(selectionItem->flags() | Qt::ItemIsUserCheckable);
-        selectionItem->setData(Qt::UserRole, selectionKey);
-        selectionItem->setCheckState(m_selectedTrainKeys.contains(selectionKey) ? Qt::Checked : Qt::Unchecked);
-        selectionItem->setToolTip(tr("이 열차 선택"));
-        ui->trainInfoTableWidget->setItem(row, 0, selectionItem);
-        const QStringList columns {train.trainType, train.trainNo, train.departure, train.departureTime,
-                                   train.arrival, train.arrivalTime, train.duration, train.generalSeat,
-                                   train.specialSeat};
-        for (int column = 0; column < columns.size(); ++column) {
-            auto *item = new QTableWidgetItem(columns.at(column));
-            item->setToolTip(columns.at(column));
-            ui->trainInfoTableWidget->setItem(row, column + 1, item);
+    int trainCount = 0;
+    for (auto iterator = m_trainInfoTabs.cbegin(); iterator != m_trainInfoTabs.cend(); ++iterator) {
+        const QString &sessionId = iterator.key();
+        const TrainInfoTab &tab = iterator.value();
+        QTableWidget *table = tab.table;
+        table->setUpdatesEnabled(false);
+        table->setRowCount(0);
+        for (const TrainInfo &train : tab.trains) {
+            const int row = table->rowCount();
+            table->insertRow(row);
+            const QString selectionKey = trainSelectionKey(sessionId, train);
+
+            auto *selectionItem = new QTableWidgetItem;
+            selectionItem->setFlags(selectionItem->flags() | Qt::ItemIsUserCheckable);
+            selectionItem->setData(Qt::UserRole, selectionKey);
+            selectionItem->setCheckState(m_selectedTrainKeys.contains(selectionKey) ? Qt::Checked : Qt::Unchecked);
+            selectionItem->setToolTip(tr("이 열차 선택"));
+            table->setItem(row, 0, selectionItem);
+
+            const QStringList columns {train.trainType, train.trainNo, train.departure, train.departureTime,
+                                       train.arrival, train.arrivalTime, train.duration, train.generalSeat,
+                                       train.specialSeat};
+            for (int column = 0; column < columns.size(); ++column) {
+                auto *item = new QTableWidgetItem(columns.at(column));
+                item->setToolTip(columns.at(column));
+                table->setItem(row, column + 1, item);
+            }
+            ++trainCount;
         }
+        table->setUpdatesEnabled(true);
     }
-    ui->trainInfoTableWidget->setUpdatesEnabled(true);
     m_updatingTrainInfoTable = false;
-    ui->trainInfoGroupBox->setTitle(tr("열차 정보 (%1건)").arg(trains.size()));
+    ui->trainInfoGroupBox->setTitle(tr("열차 정보 (%1개 탭, %2건)")
+                                        .arg(m_trainInfoTabs.size())
+                                        .arg(trainCount));
     ui->trainInfoGroupBox->setVisible(true);
 }
 
 void MainWindow::clearTrainInfoTable()
 {
     stopTrainRefreshMacro();
-    m_currentTrains.clear();
+    for (const TrainInfoTab &tab : m_trainInfoTabs) {
+        delete tab.controller;
+        delete tab.table;
+    }
+    m_trainInfoTabs.clear();
     m_selectedTrainKeys.clear();
-    m_trainInfoSessionId.clear();
-    m_autoBookingController->setTrainInfoContext({}, {});
-    ui->trainInfoTableWidget->setRowCount(0);
+    m_nextTrainInfoTabNumber = 1;
+    ui->trainInfoTabWidget->clear();
     ui->trainInfoGroupBox->setTitle(tr("열차 정보 (열차 조회 페이지 대기 중)"));
     ui->trainInfoGroupBox->setVisible(true);
 }
 
-void MainWindow::onTrainInfoItemChanged(QTableWidgetItem *item)
+void MainWindow::removeTrainInfoTab(const QString &sessionId)
+{
+    const auto iterator = m_trainInfoTabs.find(sessionId);
+    if (iterator == m_trainInfoTabs.end()) {
+        return;
+    }
+
+    delete iterator->controller;
+    const int tabIndex = ui->trainInfoTabWidget->indexOf(iterator->table);
+    if (tabIndex >= 0) {
+        ui->trainInfoTabWidget->removeTab(tabIndex);
+    }
+    delete iterator->table;
+    m_trainInfoTabs.erase(iterator);
+    for (auto selected = m_selectedTrainKeys.begin(); selected != m_selectedTrainKeys.end();) {
+        if (selected->startsWith(sessionId + QChar(0x1e))) {
+            selected = m_selectedTrainKeys.erase(selected);
+        } else {
+            ++selected;
+        }
+    }
+    updateTrainInfoTable();
+}
+
+void MainWindow::onTrainInfoItemChanged(const QString &sessionId, QTableWidgetItem *item)
 {
     if (m_updatingTrainInfoTable || !item || item->column() != 0) {
         return;
@@ -340,18 +374,105 @@ void MainWindow::onTrainInfoItemChanged(QTableWidgetItem *item)
     } else {
         m_selectedTrainKeys.remove(selectionKey);
     }
-    m_autoBookingController->setSelectedTrains(selectedTrains());
+    const auto iterator = m_trainInfoTabs.constFind(sessionId);
+    if (iterator != m_trainInfoTabs.cend()) {
+        iterator->controller->setSelectedTrains(selectedTrains(sessionId));
+    }
 }
 
-QList<TrainInfo> MainWindow::selectedTrains() const
+QList<TrainInfo> MainWindow::selectedTrains(const QString &sessionId) const
 {
     QList<TrainInfo> selected;
-    for (const TrainInfo &train : m_currentTrains) {
-        if (m_selectedTrainKeys.contains(TrainInfoParser::selectionKey(train))) {
+    const auto iterator = m_trainInfoTabs.constFind(sessionId);
+    if (iterator == m_trainInfoTabs.cend()) {
+        return selected;
+    }
+    for (const TrainInfo &train : iterator->trains) {
+        if (m_selectedTrainKeys.contains(trainSelectionKey(sessionId, train))) {
             selected.append(train);
         }
     }
     return selected;
+}
+
+QString MainWindow::trainSelectionKey(const QString &sessionId, const TrainInfo &train) const
+{
+    return sessionId + QChar(0x1e) + TrainInfoParser::selectionKey(train);
+}
+
+QTableWidget *MainWindow::createTrainInfoTable(const QString &sessionId)
+{
+    auto *table = new QTableWidget(ui->trainInfoTabWidget);
+    table->setColumnCount(10);
+    table->setHorizontalHeaderLabels(
+        {tr("선택"), tr("열차"), tr("번호"), tr("출발역"), tr("출발 시각"),
+         tr("도착역"), tr("도착 시각"), tr("소요 시간"), tr("일반실"), tr("특실")});
+    table->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+    table->horizontalHeader()->setStretchLastSection(true);
+    table->verticalHeader()->setVisible(false);
+    table->setAlternatingRowColors(true);
+    table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    table->setSelectionBehavior(QAbstractItemView::SelectRows);
+    table->setSelectionMode(QAbstractItemView::SingleSelection);
+    connect(table, &QTableWidget::itemChanged, this,
+            [this, sessionId](QTableWidgetItem *item) {
+                onTrainInfoItemChanged(sessionId, item);
+            });
+    return table;
+}
+
+AutoBookingController *MainWindow::createAutoBookingController(const QString &sessionId,
+                                                                const QString &label)
+{
+    auto *controller = new AutoBookingController(m_recorderCdpClient, m_pageRecorder, this);
+    controller->setRefreshIntervalSeconds(ui->macroRefreshIntervalSpinBox->value());
+    controller->setAutoBookWhenAvailable(ui->autoBookWhenAvailableCheckBox->isChecked());
+    controller->setTrainInfoSession(sessionId);
+
+    connect(controller, &AutoBookingController::statusChanged, this,
+            [this, label](const QString &message) {
+                showStatus(tr("%1: %2").arg(label, message));
+            });
+    connect(controller, &AutoBookingController::bookingFailed, this,
+            [this, label](const QString &message) {
+                showStatus(tr("%1: %2").arg(label, message), true);
+            });
+    connect(controller, &AutoBookingController::bookingSucceeded, this, [this, label]() {
+        stopTrainRefreshMacro();
+        sendBookingNotification(label);
+    });
+    return controller;
+}
+
+void MainWindow::updateTrainRefreshMacroUi()
+{
+    ui->startTrainRefreshMacroButton->setEnabled(!m_trainRefreshMacroRunning);
+    ui->stopTrainRefreshMacroButton->setEnabled(m_trainRefreshMacroRunning);
+}
+
+void MainWindow::sendBookingNotification(const QString &tab)
+{
+    QNetworkRequest request(QUrl(QStringLiteral("https://ntfy.sh/ktx")));
+    request.setHeader(QNetworkRequest::ContentTypeHeader,
+                      QStringLiteral("text/plain; charset=utf-8"));
+    request.setAttribute(QNetworkRequest::Http2AllowedAttribute, false);
+    request.setRawHeader("Title", QStringLiteral("KTX 예매 완료").toUtf8());
+    request.setRawHeader("Priority", "high");
+
+    QNetworkReply *reply = m_notificationNetworkManager->post(
+        request, tr("%1에서 KTX 예매가 완료되었습니다.").arg(tab).toUtf8());
+    connect(reply, &QNetworkReply::finished, this, [this, reply, tab]() {
+        const int statusCode = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        if (reply->error() != QNetworkReply::NoError || statusCode < 200 || statusCode >= 300) {
+            showStatus(tr("%1: ntfy 예매 완료 알림을 전송하지 못했습니다: %2")
+                           .arg(tab, reply->errorString()), true);
+        } else {
+            showStatus(tr("%1: ntfy 예매 완료 알림을 전송했습니다 (HTTP %2).")
+                           .arg(tab)
+                           .arg(statusCode));
+        }
+        reply->deleteLater();
+    });
 }
 
 void MainWindow::updatePageRecordingUi(bool active)

@@ -162,8 +162,10 @@ void AutoBookingController::startAutoBooking(const TrainInfo &train)
     };
     const isReservable = (text) => {
         const value = clean(text);
+        const isNearlySoldOut = /매진\s*임박/.test(value);
         return (/예매|예약|\b\d{1,3}(?:,\d{3})*\s*원/.test(value))
-            && !/매진|없음|불가|대기/.test(value);
+            && !(/매진/.test(value) && !isNearlySoldOut)
+            && !/없음|불가|대기/.test(value);
     };
     const isUsable = (element) => {
         if (!element || element.disabled || element.getAttribute('aria-disabled') === 'true'

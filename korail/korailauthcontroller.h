@@ -27,6 +27,8 @@ private:
         Idle,
         CreatingTarget,
         AttachingTarget,
+        EnablingNetwork,
+        DisablingCache,
         EnablingPage,
         Navigating,
         WaitingForLoginForm,

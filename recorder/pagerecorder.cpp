@@ -298,6 +298,8 @@ void PageRecorder::attachToPage(const QJsonObject &parameters)
     m_targetToSession.insert(targetId, sessionId);
     sendCommand(QStringLiteral("Page.enable"), {}, sessionId);
     sendCommand(QStringLiteral("Network.enable"), {}, sessionId);
+    sendCommand(QStringLiteral("Network.setCacheDisabled"),
+                {{QStringLiteral("cacheDisabled"), true}}, sessionId);
     schedulePageSnapshot(sessionId, 800);
 }
 

@@ -91,6 +91,15 @@ void KorailAuthController::onCommandResult(int id, const QJsonObject &result)
             finish(tr("코레일 로그인 탭에 연결하지 못했습니다."), true);
             return;
         }
+        m_step = LoginStep::EnablingNetwork;
+        sendCommand(QStringLiteral("Network.enable"));
+        return;
+    case LoginStep::EnablingNetwork:
+        m_step = LoginStep::DisablingCache;
+        sendCommand(QStringLiteral("Network.setCacheDisabled"),
+                    {{QStringLiteral("cacheDisabled"), true}});
+        return;
+    case LoginStep::DisablingCache:
         m_step = LoginStep::EnablingPage;
         sendCommand(QStringLiteral("Page.enable"));
         return;

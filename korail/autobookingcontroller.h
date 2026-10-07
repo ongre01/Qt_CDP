@@ -30,6 +30,8 @@ signals:
     void bookingStarted();
     void bookingSucceeded();
     void bookingFailed(const QString &reason);
+    void refreshRequested();
+    void refreshFailed(const QString &reason);
     void runningChanged(bool running);
     void statusChanged(const QString &message);
 

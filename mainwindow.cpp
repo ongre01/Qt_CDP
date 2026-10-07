@@ -10,19 +10,26 @@
 
 #include <QCheckBox>
 #include <QCryptographicHash>
+#include <QDateTime>
 #include <QDesktopServices>
 #include <QDir>
+#include <QFile>
+#include <QFileInfo>
 #include <QHeaderView>
 #include <QJsonDocument>
+#include <QJsonObject>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QSettings>
 #include <QSpinBox>
+#include <QStandardPaths>
 #include <QTableWidgetItem>
 #include <QTabWidget>
 #include <QTimer>
 #include <QUrl>
+
+#include <algorithm>
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
@@ -50,12 +57,22 @@ MainWindow::MainWindow(QWidget *parent)
     ui->snapshotDirectoryEdit->setText(SnapshotStorage::defaultDirectory());
     ui->trainInfoGroupBox->setTitle(tr("열차 정보 (열차 조회 페이지 대기 중)"));
     ui->trainInfoGroupBox->setVisible(true);
+    ui->monitoringStatusTable->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+    ui->monitoringStatusTable->horizontalHeader()->setStretchLastSection(true);
+    ui->monitoringStatusTable->verticalHeader()->setVisible(false);
+    ui->monitoringStatusTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    ui->monitoringStatusTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+    ui->monitoringStatusTable->setAlternatingRowColors(true);
+    ui->auditLogPathLabel->setText(tr("감사 로그: %1").arg(auditLogPath()));
+    ui->auditLogPathLabel->setToolTip(auditLogPath());
+    ui->auditLogPathLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
     m_noScreenChangeTimer->setSingleShot(true);
 
     connect(ui->startChromeButton, &QPushButton::clicked, this, &MainWindow::startChromeForCdp);
     connect(ui->korailAutoLoginButton, &QPushButton::clicked, this, &MainWindow::startKorailAutoLogin);
     connect(ui->pageRecordingButton, &QPushButton::clicked, this, &MainWindow::togglePageRecording);
     connect(ui->openSnapshotDirectoryButton, &QPushButton::clicked, this, &MainWindow::openSnapshotDirectory);
+    connect(ui->openAuditLogButton, &QPushButton::clicked, this, &MainWindow::openAuditLogDirectory);
     connect(ui->startTrainRefreshMacroButton, &QPushButton::clicked, this, &MainWindow::startTrainRefreshMacro);
     connect(ui->stopTrainRefreshMacroButton, &QPushButton::clicked, this, [this]() {
         stopTrainRefreshMacro(tr("열차 예매 확인 매크로를 중지했습니다."));
@@ -295,9 +312,13 @@ void MainWindow::onDomSnapshotCaptured(const QJsonObject &snapshot, const QStrin
         }
 
         TrainInfoTab &tab = m_trainInfoTabs[sessionId];
+        tab.lastCheckedAt = QDateTime::currentDateTime();
+        tab.failureReason.clear();
         if (trains.isEmpty() && m_trainRefreshMacroRunning && !tab.trains.isEmpty()) {
+            updateMonitoringStatusTable();
             return;
         }
+        updateSeatStatusChange(tab, trains);
         tab.trains = trains;
         tab.controller->setTrainInfoContext(sessionId, selectedTrains(sessionId));
         if (m_trainRefreshMacroRunning) {
@@ -352,6 +373,84 @@ void MainWindow::updateTrainInfoTable()
                                         .arg(m_trainInfoTabs.size())
                                         .arg(trainCount));
     ui->trainInfoGroupBox->setVisible(true);
+    updateMonitoringStatusTable();
+}
+
+void MainWindow::updateMonitoringStatusTable()
+{
+    QStringList sessionIds = m_trainInfoTabs.keys();
+    std::sort(sessionIds.begin(), sessionIds.end(), [this](const QString &left, const QString &right) {
+        return m_trainInfoTabs.value(left).number < m_trainInfoTabs.value(right).number;
+    });
+
+    QTableWidget *table = ui->monitoringStatusTable;
+    table->setUpdatesEnabled(false);
+    table->setRowCount(sessionIds.size());
+    for (int row = 0; row < sessionIds.size(); ++row) {
+        const TrainInfoTab &tab = m_trainInfoTabs.value(sessionIds.at(row));
+        const QStringList values {
+            tr("탭 %1").arg(tab.number),
+            tab.lastCheckedAt.isValid() ? tab.lastCheckedAt.toString(QStringLiteral("HH:mm:ss")) : tr("확인 전"),
+            tr("%1회").arg(tab.refreshCount),
+            tab.seatStatusChange.isEmpty() ? tr("확인 전") : tab.seatStatusChange,
+            tab.failureReason.isEmpty() ? tr("-") : tab.failureReason
+        };
+        for (int column = 0; column < values.size(); ++column) {
+            auto *item = new QTableWidgetItem(values.at(column));
+            item->setToolTip(values.at(column));
+            table->setItem(row, column, item);
+        }
+    }
+    table->setUpdatesEnabled(true);
+}
+
+void MainWindow::updateSeatStatusChange(TrainInfoTab &tab, const QList<TrainInfo> &trains)
+{
+    QHash<QString, QString> currentStatuses;
+    QHash<QString, QString> trainLabels;
+    for (const TrainInfo &train : trains) {
+        const QString key = TrainInfoParser::selectionKey(train);
+        currentStatuses.insert(key, tr("일반실 %1 / 특실 %2")
+                                       .arg(train.generalSeat.isEmpty() ? tr("정보 없음") : train.generalSeat,
+                                            train.specialSeat.isEmpty() ? tr("정보 없음") : train.specialSeat));
+        trainLabels.insert(key, tr("%1 %2 (%3→%4)")
+                                   .arg(train.trainType, train.trainNo, train.departure, train.arrival));
+    }
+
+    if (tab.seatStatuses.isEmpty()) {
+        tab.seatStatusChange = tr("초기 확인");
+        tab.seatStatuses = currentStatuses;
+        return;
+    }
+
+    QStringList changes;
+    for (auto iterator = currentStatuses.cbegin(); iterator != currentStatuses.cend(); ++iterator) {
+        const auto previous = tab.seatStatuses.constFind(iterator.key());
+        if (previous == tab.seatStatuses.cend()) {
+            changes.append(tr("%1 추가됨").arg(trainLabels.value(iterator.key())));
+        } else if (previous.value() != iterator.value()) {
+            changes.append(tr("%1: %2 → %3")
+                               .arg(trainLabels.value(iterator.key()), previous.value(), iterator.value()));
+        }
+    }
+    for (auto iterator = tab.seatStatuses.cbegin(); iterator != tab.seatStatuses.cend(); ++iterator) {
+        if (!currentStatuses.contains(iterator.key())) {
+            changes.append(tr("열차 정보가 목록에서 사라짐"));
+        }
+    }
+
+    if (changes.isEmpty()) {
+        tab.seatStatusChange = tr("변화 없음");
+    } else {
+        constexpr int maxVisibleChanges = 2;
+        const int changeCount = changes.size();
+        if (changeCount > maxVisibleChanges) {
+            changes = changes.mid(0, maxVisibleChanges);
+            changes.append(tr("외 %1건").arg(changeCount - maxVisibleChanges));
+        }
+        tab.seatStatusChange = changes.join(QStringLiteral(" / "));
+    }
+    tab.seatStatuses = currentStatuses;
 }
 
 void MainWindow::clearTrainInfoTable()
@@ -366,6 +465,7 @@ void MainWindow::clearTrainInfoTable()
     m_selectedTrainKeys.clear();
     m_nextTrainInfoTabNumber = 1;
     ui->trainInfoTabWidget->clear();
+    ui->monitoringStatusTable->setRowCount(0);
     ui->trainInfoGroupBox->setTitle(tr("열차 정보 (열차 조회 페이지 대기 중)"));
     ui->trainInfoGroupBox->setVisible(true);
 }
@@ -467,11 +567,41 @@ AutoBookingController *MainWindow::createAutoBookingController(const QString &se
             [this, label](const QString &message) {
                 showStatus(tr("%1: %2").arg(label, message));
             });
+    connect(controller, &AutoBookingController::refreshRequested, this, [this, sessionId]() {
+        const auto iterator = m_trainInfoTabs.find(sessionId);
+        if (iterator == m_trainInfoTabs.end()) {
+            return;
+        }
+        ++iterator->refreshCount;
+        updateMonitoringStatusTable();
+    });
+    connect(controller, &AutoBookingController::refreshFailed, this,
+            [this, sessionId, label](const QString &message) {
+                const auto iterator = m_trainInfoTabs.find(sessionId);
+                if (iterator != m_trainInfoTabs.end()) {
+                    iterator->failureReason = message;
+                    updateMonitoringStatusTable();
+                }
+                appendAuditLog(QStringLiteral("refresh"), QStringLiteral("failure"), label, message);
+            });
     connect(controller, &AutoBookingController::bookingFailed, this,
-            [this, label](const QString &message) {
+            [this, sessionId, label](const QString &message) {
+                const auto iterator = m_trainInfoTabs.find(sessionId);
+                if (iterator != m_trainInfoTabs.end()) {
+                    iterator->failureReason = message;
+                    updateMonitoringStatusTable();
+                }
+                appendAuditLog(QStringLiteral("booking"), QStringLiteral("failure"), label, message);
                 showStatus(tr("%1: %2").arg(label, message), true);
             });
-    connect(controller, &AutoBookingController::bookingSucceeded, this, [this, label]() {
+    connect(controller, &AutoBookingController::bookingSucceeded, this, [this, sessionId, label]() {
+        const auto iterator = m_trainInfoTabs.find(sessionId);
+        if (iterator != m_trainInfoTabs.end()) {
+            iterator->failureReason.clear();
+            updateMonitoringStatusTable();
+        }
+        appendAuditLog(QStringLiteral("booking"), QStringLiteral("success"), label,
+                       tr("자동 예매 성공 신호를 받았습니다."));
         stopTrainRefreshMacro();
         sendBookingNotification(label);
     });
@@ -498,9 +628,13 @@ void MainWindow::sendBookingNotification(const QString &tab)
     connect(reply, &QNetworkReply::finished, this, [this, reply, tab]() {
         const int statusCode = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
         if (reply->error() != QNetworkReply::NoError || statusCode < 200 || statusCode >= 300) {
+            appendAuditLog(QStringLiteral("notification"), QStringLiteral("failure"), tab,
+                           tr("ntfy 예매 완료 알림: %1").arg(reply->errorString()), statusCode);
             showStatus(tr("%1: ntfy 예매 완료 알림을 전송하지 못했습니다: %2")
                            .arg(tab, reply->errorString()), true);
         } else {
+            appendAuditLog(QStringLiteral("notification"), QStringLiteral("success"), tab,
+                           tr("ntfy 예매 완료 알림"), statusCode);
             showStatus(tr("%1: ntfy 예매 완료 알림을 전송했습니다 (HTTP %2).")
                            .arg(tab)
                            .arg(statusCode));
@@ -542,16 +676,68 @@ void MainWindow::sendNoScreenChangeNotification()
     connect(reply, &QNetworkReply::finished, this, [this, reply, timeoutSeconds]() {
         const int statusCode = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
         if (reply->error() != QNetworkReply::NoError || statusCode < 200 || statusCode >= 300) {
+            appendAuditLog(QStringLiteral("notification"), QStringLiteral("failure"), tr("전체 탭"),
+                           tr("ntfy 무변화 알림: %1").arg(reply->errorString()), statusCode);
             showStatus(tr("%1초 무변화 ntfy 알림을 전송하지 못했습니다: %2")
                            .arg(timeoutSeconds)
                            .arg(reply->errorString()), true);
         } else {
+            appendAuditLog(QStringLiteral("notification"), QStringLiteral("success"), tr("전체 탭"),
+                           tr("ntfy 무변화 알림"), statusCode);
             showStatus(tr("%1초 동안 화면 변화가 없어 ntfy 알림을 전송했습니다 (HTTP %2).")
                            .arg(timeoutSeconds)
                            .arg(statusCode));
         }
         reply->deleteLater();
     });
+}
+
+void MainWindow::openAuditLogDirectory()
+{
+    const QString directory = QFileInfo(auditLogPath()).absolutePath();
+    if (!QDir().mkpath(directory)) {
+        showStatus(tr("감사 로그 폴더를 만들 수 없습니다."), true);
+        return;
+    }
+    if (!QDesktopServices::openUrl(QUrl::fromLocalFile(directory))) {
+        showStatus(tr("감사 로그 폴더를 열 수 없습니다."), true);
+    }
+}
+
+QString MainWindow::auditLogPath() const
+{
+    QString directory = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    if (directory.isEmpty()) {
+        directory = QDir::tempPath();
+    }
+    return QDir(directory).filePath(QStringLiteral("booking-audit.jsonl"));
+}
+
+bool MainWindow::appendAuditLog(const QString &event, const QString &result, const QString &tab,
+                                const QString &detail, int httpStatusCode) const
+{
+    const QString path = auditLogPath();
+    if (!QDir().mkpath(QFileInfo(path).absolutePath())) {
+        return false;
+    }
+
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
+        return false;
+    }
+
+    QJsonObject entry {
+        {QStringLiteral("timestamp"), QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)},
+        {QStringLiteral("event"), event},
+        {QStringLiteral("result"), result},
+        {QStringLiteral("tab"), tab},
+        {QStringLiteral("detail"), detail}
+    };
+    if (httpStatusCode >= 0) {
+        entry.insert(QStringLiteral("httpStatusCode"), httpStatusCode);
+    }
+    const QByteArray line = QJsonDocument(entry).toJson(QJsonDocument::Compact) + '\n';
+    return file.write(line) == line.size();
 }
 
 void MainWindow::updatePageRecordingUi(bool active)

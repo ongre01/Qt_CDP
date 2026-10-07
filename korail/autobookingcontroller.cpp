@@ -112,10 +112,13 @@ void AutoBookingController::refreshSelectedTrainPage()
         return;
     }
     if (!m_pageRecorder->reloadPage(m_sessionId)) {
+        const QString reason = tr("선택한 열차 정보를 새로고침하지 못했습니다.");
         stop();
-        emit statusChanged(tr("선택한 열차 정보를 새로고침하지 못했습니다."));
+        emit refreshFailed(reason);
+        emit statusChanged(reason);
         return;
     }
+    emit refreshRequested();
     emit statusChanged(tr("선택한 열차의 예매 가능 여부를 다시 확인하기 위해 페이지를 새로고침했습니다."));
 }
 

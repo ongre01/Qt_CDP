@@ -6,8 +6,8 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>980</width>
-    <height>720</height>
+    <width>1100</width>
+    <height>820</height>
    </rect>
   </property>
   <property name="windowTitle">
@@ -193,10 +193,87 @@
     </item>
     <item>
      <widget class="QGroupBox" name="trainInfoGroupBox">
-      <property name="title">
-       <string>열차 정보</string>
+     <property name="title">
+       <string>열차 정보 및 모니터링</string>
       </property>
       <layout class="QVBoxLayout" name="trainInfoLayout">
+       <item>
+        <widget class="QGroupBox" name="monitoringStatusGroupBox">
+         <property name="title">
+          <string>탭별 모니터링 상태</string>
+         </property>
+         <layout class="QVBoxLayout" name="monitoringStatusLayout">
+          <item>
+           <widget class="QTableWidget" name="monitoringStatusTable">
+            <property name="minimumSize">
+             <size>
+              <width>0</width>
+              <height>110</height>
+             </size>
+            </property>
+            <property name="maximumSize">
+             <size>
+              <width>16777215</width>
+              <height>160</height>
+             </size>
+            </property>
+            <property name="rowCount">
+             <number>0</number>
+            </property>
+            <property name="columnCount">
+             <number>5</number>
+            </property>
+            <column>
+             <property name="text">
+              <string>탭</string>
+             </property>
+            </column>
+            <column>
+             <property name="text">
+              <string>마지막 확인</string>
+             </property>
+            </column>
+            <column>
+             <property name="text">
+              <string>새로고침</string>
+             </property>
+            </column>
+            <column>
+             <property name="text">
+              <string>좌석 상태 변화</string>
+             </property>
+            </column>
+            <column>
+             <property name="text">
+              <string>실패 원인</string>
+             </property>
+            </column>
+           </widget>
+          </item>
+          <item>
+           <layout class="QHBoxLayout" name="auditLogLayout">
+            <item>
+             <widget class="QLabel" name="auditLogPathLabel">
+              <property name="text">
+               <string>감사 로그:</string>
+              </property>
+              <property name="wordWrap">
+               <bool>true</bool>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QPushButton" name="openAuditLogButton">
+              <property name="text">
+               <string>감사 로그 폴더 열기</string>
+              </property>
+             </widget>
+            </item>
+           </layout>
+          </item>
+         </layout>
+        </widget>
+       </item>
        <item>
         <widget class="QTabWidget" name="trainInfoTabWidget">
          <property name="documentMode">
@@ -296,7 +373,7 @@
     <rect>
      <x>0</x>
      <y>0</y>
-     <width>980</width>
+     <width>1100</width>
      <height>21</height>
     </rect>
    </property>

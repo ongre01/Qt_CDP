@@ -3,6 +3,7 @@
 
 #include <QMainWindow>
 #include <QByteArray>
+#include <QDateTime>
 #include <QHash>
 #include <QList>
 #include <QSet>
@@ -40,6 +41,11 @@ private:
         QList<TrainInfo> trains;
         AutoBookingController *controller = nullptr;
         QTableWidget *table = nullptr;
+        QDateTime lastCheckedAt;
+        int refreshCount = 0;
+        QString seatStatusChange;
+        QString failureReason;
+        QHash<QString, QString> seatStatuses;
     };
 
     void startChromeForCdp();
@@ -51,6 +57,8 @@ private:
     void stopTrainRefreshMacro(const QString &message = QString());
     void onDomSnapshotCaptured(const QJsonObject &snapshot, const QString &sessionId);
     void updateTrainInfoTable();
+    void updateMonitoringStatusTable();
+    void updateSeatStatusChange(TrainInfoTab &tab, const QList<TrainInfo> &trains);
     void clearTrainInfoTable();
     void removeTrainInfoTab(const QString &sessionId);
     void onTrainInfoItemChanged(const QString &sessionId, QTableWidgetItem *item);
@@ -63,6 +71,10 @@ private:
     void sendBookingNotification(const QString &tab);
     void armNoScreenChangeNotification();
     void sendNoScreenChangeNotification();
+    void openAuditLogDirectory();
+    QString auditLogPath() const;
+    bool appendAuditLog(const QString &event, const QString &result, const QString &tab,
+                        const QString &detail, int httpStatusCode = -1) const;
     void updatePageRecordingUi(bool active);
     void setBusy(bool busy);
     void showStatus(const QString &message, bool isError = false);

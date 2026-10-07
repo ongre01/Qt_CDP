@@ -50,12 +50,6 @@ MainWindow::MainWindow(QWidget *parent)
     connect(ui->stopTrainRefreshMacroButton, &QPushButton::clicked, this, [this]() {
         stopTrainRefreshMacro(tr("열차 예매 확인 매크로를 중지했습니다."));
     });
-    connect(ui->macroRefreshIntervalSpinBox, &QSpinBox::valueChanged, this,
-            [this](int seconds) {
-                for (const TrainInfoTab &tab : m_trainInfoTabs) {
-                    tab.controller->setRefreshIntervalSeconds(seconds);
-                }
-            });
     connect(ui->autoBookWhenAvailableCheckBox, &QCheckBox::toggled, this,
             [this](bool enabled) {
                 for (const TrainInfoTab &tab : m_trainInfoTabs) {
@@ -425,7 +419,6 @@ AutoBookingController *MainWindow::createAutoBookingController(const QString &se
                                                                 const QString &label)
 {
     auto *controller = new AutoBookingController(m_recorderCdpClient, m_pageRecorder, this);
-    controller->setRefreshIntervalSeconds(ui->macroRefreshIntervalSpinBox->value());
     controller->setAutoBookWhenAvailable(ui->autoBookWhenAvailableCheckBox->isChecked());
     controller->setTrainInfoSession(sessionId);
 

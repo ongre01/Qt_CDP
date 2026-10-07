@@ -9,7 +9,6 @@
 
 class CdpClient;
 class PageRecorder;
-class QTimer;
 
 class AutoBookingController : public QObject
 {
@@ -22,7 +21,6 @@ public:
     void start();
     void stop();
     bool isRunning() const;
-    void setRefreshIntervalSeconds(int seconds);
     void setAutoBookWhenAvailable(bool enabled);
     void setSelectedTrains(const QList<TrainInfo> &trains);
     void setTrainInfoSession(const QString &sessionId);
@@ -64,7 +62,6 @@ private:
 
     CdpClient *m_cdpClient;
     PageRecorder *m_pageRecorder;
-    QTimer *m_refreshTimer;
     QList<TrainInfo> m_selectedTrains;
     QString m_sessionId;
     bool m_running = false;

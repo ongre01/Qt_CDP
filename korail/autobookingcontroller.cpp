@@ -11,10 +11,7 @@ AutoBookingController::AutoBookingController(CdpClient *cdpClient, PageRecorder 
     : QObject(parent)
     , m_cdpClient(cdpClient)
     , m_pageRecorder(pageRecorder)
-    , m_refreshTimer(new QTimer(this))
 {
-    m_refreshTimer->setSingleShot(true);
-    connect(m_refreshTimer, &QTimer::timeout, this, &AutoBookingController::refreshSelectedTrainPage);
     connect(m_cdpClient, &CdpClient::commandResult, this, &AutoBookingController::onCommandResult);
     connect(m_cdpClient, &CdpClient::commandError, this, &AutoBookingController::onCommandError);
     connect(m_pageRecorder, &PageRecorder::monitoringStarted, this, &AutoBookingController::update);
@@ -33,7 +30,6 @@ void AutoBookingController::stop()
 {
     const bool wasRunning = m_running;
     m_running = false;
-    m_refreshTimer->stop();
     resetBookingState();
     if (wasRunning) {
         emit runningChanged(false);
@@ -43,14 +39,6 @@ void AutoBookingController::stop()
 bool AutoBookingController::isRunning() const
 {
     return m_running;
-}
-
-void AutoBookingController::setRefreshIntervalSeconds(int seconds)
-{
-    m_refreshTimer->setInterval(seconds * 1000);
-    if (m_running && m_refreshTimer->isActive()) {
-        m_refreshTimer->start();
-    }
 }
 
 void AutoBookingController::setAutoBookWhenAvailable(bool enabled)
@@ -84,16 +72,13 @@ void AutoBookingController::setTrainInfoContext(const QString &sessionId,
 void AutoBookingController::update()
 {
     if (!m_running) {
-        m_refreshTimer->stop();
         return;
     }
     if (m_bookingInProgress) {
-        m_refreshTimer->stop();
         return;
     }
     const TrainInfo *train = reservableSelectedTrain();
     if (m_selectedTrains.isEmpty()) {
-        m_refreshTimer->stop();
         emit statusChanged(tr("매크로가 준비되었습니다. 예매 가능 여부를 확인할 열차를 선택하세요."));
         return;
     }
@@ -110,11 +95,7 @@ void AutoBookingController::update()
         || !m_pageRecorder->hasSession(m_sessionId)) {
         return;
     }
-    if (!m_refreshTimer->isActive()) {
-        emit statusChanged(tr("선택한 열차의 예매 가능 여부를 확인 중입니다. %1초 후 페이지를 새로고침합니다.")
-                               .arg(m_refreshTimer->interval() / 1000));
-        m_refreshTimer->start();
-    }
+    refreshSelectedTrainPage();
 }
 
 void AutoBookingController::refreshSelectedTrainPage()
@@ -252,7 +233,6 @@ void AutoBookingController::startAutoBooking(const TrainInfo &train)
 
     resetBookingState();
     m_bookingInProgress = true;
-    m_refreshTimer->stop();
     const int commandId = sendCommand(QStringLiteral("Runtime.evaluate"),
                                       {{QStringLiteral("expression"), expression}, {QStringLiteral("returnByValue"), true},
                                        {QStringLiteral("awaitPromise"), true}, {QStringLiteral("userGesture"), true}},

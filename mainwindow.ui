@@ -120,29 +120,6 @@
       </property>
       <layout class="QHBoxLayout" name="trainRefreshMacroLayout">
        <item>
-        <widget class="QLabel" name="macroRefreshIntervalLabel">
-         <property name="text">
-          <string>새로고침 간격:</string>
-         </property>
-        </widget>
-       </item>
-       <item>
-        <widget class="QSpinBox" name="macroRefreshIntervalSpinBox">
-         <property name="suffix">
-          <string>초</string>
-         </property>
-         <property name="minimum">
-          <number>1</number>
-         </property>
-         <property name="maximum">
-          <number>3600</number>
-         </property>
-         <property name="value">
-          <number>1</number>
-         </property>
-        </widget>
-       </item>
-       <item>
         <widget class="QCheckBox" name="autoBookWhenAvailableCheckBox">
          <property name="toolTip">
           <string>각 조회 탭에서 선택 열차의 예매 가능한 좌석을 찾으면, 해당 탭의 예매 버튼을 동시에 자동으로 누릅니다.</string>

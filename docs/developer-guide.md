@@ -55,7 +55,7 @@ flowchart TD
 
 `PageRecorder`는 CDP 연결 후 `Target.setDiscoverTargets`, `Target.setAutoAttach`, `Target.getTargets`로 page target을 탐색·연결합니다. 연결된 페이지 세션에서 `DOMSnapshot.captureSnapshot`을 요청하고 `snapshotCaptured` 신호를 발생시킵니다.
 
-`MainWindow::onDomSnapshotCaptured()`는 스냅샷을 `TrainInfoParser`에 전달해 코레일 열차 조회 페이지인지와 열차 목록을 판정합니다. 조회 페이지마다 열차 테이블과 `AutoBookingController`를 하나씩 유지합니다. 따라서 여러 브라우저 탭의 선택 열차를 병렬로 제어할 수 있습니다.
+`MainWindow::onDomSnapshotCaptured()`는 스냅샷을 `TrainInfoParser`에 전달해 코레일 열차 조회 페이지인지와 열차 목록을 판정합니다. 조회 페이지마다 열차 테이블과 `AutoBookingController`를 하나씩 유지합니다. 따라서 여러 브라우저 탭의 선택 열차를 병렬로 제어할 수 있습니다. 실행 중에는 각 조회 탭의 DOM 스냅샷을 SHA-256 지문으로 비교해 변화를 감지합니다. 변화가 없으면 `MainWindow`의 단일 타이머가 설정 시간 뒤 ntfy 알림을 한 번 보내며, 다음 변화가 감지될 때까지 같은 구간에서 중복 전송하지 않습니다.
 
 `AutoBookingController`는 실행 중 선택 열차에 예약 가능 좌석이 없으면 해당 페이지 세션으로 `Page.reload`를 전송합니다. 예약 가능 좌석을 찾으면 자동 예매 옵션에 따라 멈춰 알리거나, CDP의 `Runtime.evaluate`와 입력 이벤트를 사용해 예매 절차를 진행합니다.
 
@@ -73,7 +73,7 @@ flowchart TD
 2. **CDP 연결**: 로컬 Chrome을 시작하거나 연결한 뒤 `/json/version`과 WebSocket 연결이 성공하는지 확인합니다.
 3. **로그인**: 실제 계정을 사용하기 전에 테스트 환경에서 실패·중단·연결 해제 시 UI가 busy 상태에서 복구되는지 확인합니다.
 4. **페이지 기록**: 입력 필드와 textarea가 있는 페이지를 기록한 뒤 생성된 JSON에 원문 값 대신 `[REDACTED]`가 저장되는지 확인합니다.
-5. **열차 정보·매크로**: 조회 페이지를 여러 탭으로 열고 탭 생성·선택 유지·탭 닫힘·매크로 중지를 확인합니다.
+5. **열차 정보·매크로**: 조회 페이지를 여러 탭으로 열고 탭 생성·선택 유지·탭 닫힘·매크로 중지를 확인합니다. 설정한 무변화 시간이 지난 뒤 ntfy 요청이 한 번만 전송되는지와, DOM 변화 후 다음 감시 구간이 다시 시작되는지도 확인합니다.
 6. **자동 예매**: 실제 예약이나 결제를 유발할 수 있으므로, 변경 검증 시에는 안전한 계정·환경과 명시적인 운영 승인 없이 활성화하지 않습니다.
 
 ## 유지보수 유의사항

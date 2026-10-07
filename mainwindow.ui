@@ -120,6 +120,32 @@
       </property>
       <layout class="QHBoxLayout" name="trainRefreshMacroLayout">
        <item>
+        <widget class="QLabel" name="noScreenChangeTimeoutLabel">
+         <property name="text">
+          <string>무변화 알림:</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QSpinBox" name="noScreenChangeTimeoutSpinBox">
+         <property name="toolTip">
+          <string>이 시간 동안 열차 조회 페이지의 DOM 변화가 없으면 ntfy 알림을 보냅니다.</string>
+         </property>
+         <property name="suffix">
+          <string>초</string>
+         </property>
+         <property name="minimum">
+          <number>10</number>
+         </property>
+         <property name="maximum">
+          <number>3600</number>
+         </property>
+         <property name="value">
+          <number>60</number>
+         </property>
+        </widget>
+       </item>
+       <item>
         <widget class="QCheckBox" name="autoBookWhenAvailableCheckBox">
          <property name="toolTip">
           <string>각 조회 탭에서 선택 열차의 예매 가능한 좌석을 찾으면, 해당 탭의 예매 버튼을 동시에 자동으로 누릅니다.</string>

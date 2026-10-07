@@ -9,15 +9,19 @@
 #include "recorder/snapshotstorage.h"
 
 #include <QCheckBox>
+#include <QCryptographicHash>
 #include <QDesktopServices>
 #include <QDir>
 #include <QHeaderView>
+#include <QJsonDocument>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QSettings>
+#include <QSpinBox>
 #include <QTableWidgetItem>
 #include <QTabWidget>
+#include <QTimer>
 #include <QUrl>
 
 MainWindow::MainWindow(QWidget *parent)
@@ -30,6 +34,7 @@ MainWindow::MainWindow(QWidget *parent)
     , m_authController(new KorailAuthController(m_authCdpClient, this))
     , m_pageRecorder(new PageRecorder(m_recorderCdpClient, m_snapshotStorage, this))
     , m_notificationNetworkManager(new QNetworkAccessManager(this))
+    , m_noScreenChangeTimer(new QTimer(this))
 {
     ui->setupUi(this);
     QSettings settings(QSettings::IniFormat, QSettings::UserScope,
@@ -38,9 +43,14 @@ MainWindow::MainWindow(QWidget *parent)
     ui->memberNumberEdit->setText(settings.value(QStringLiteral("memberNumber")).toString());
     ui->korailPasswordEdit->setText(settings.value(QStringLiteral("password")).toString());
     settings.endGroup();
+    settings.beginGroup(QStringLiteral("TrainRefreshMacro"));
+    ui->noScreenChangeTimeoutSpinBox->setValue(
+        settings.value(QStringLiteral("noScreenChangeTimeoutSeconds"), 60).toInt());
+    settings.endGroup();
     ui->snapshotDirectoryEdit->setText(SnapshotStorage::defaultDirectory());
     ui->trainInfoGroupBox->setTitle(tr("열차 정보 (열차 조회 페이지 대기 중)"));
     ui->trainInfoGroupBox->setVisible(true);
+    m_noScreenChangeTimer->setSingleShot(true);
 
     connect(ui->startChromeButton, &QPushButton::clicked, this, &MainWindow::startChromeForCdp);
     connect(ui->korailAutoLoginButton, &QPushButton::clicked, this, &MainWindow::startKorailAutoLogin);
@@ -50,12 +60,25 @@ MainWindow::MainWindow(QWidget *parent)
     connect(ui->stopTrainRefreshMacroButton, &QPushButton::clicked, this, [this]() {
         stopTrainRefreshMacro(tr("열차 예매 확인 매크로를 중지했습니다."));
     });
+    connect(ui->noScreenChangeTimeoutSpinBox, QOverload<int>::of(&QSpinBox::valueChanged), this,
+            [this](int seconds) {
+                QSettings settings(QSettings::IniFormat, QSettings::UserScope,
+                                   QStringLiteral("Qt_CDP"), QStringLiteral("Qt_CDP"));
+                settings.beginGroup(QStringLiteral("TrainRefreshMacro"));
+                settings.setValue(QStringLiteral("noScreenChangeTimeoutSeconds"), seconds);
+                settings.endGroup();
+                if (m_trainRefreshMacroRunning) {
+                    armNoScreenChangeNotification();
+                }
+            });
     connect(ui->autoBookWhenAvailableCheckBox, &QCheckBox::toggled, this,
             [this](bool enabled) {
                 for (const TrainInfoTab &tab : m_trainInfoTabs) {
                     tab.controller->setAutoBookWhenAvailable(enabled);
                 }
             });
+    connect(m_noScreenChangeTimer, &QTimer::timeout, this,
+            &MainWindow::sendNoScreenChangeNotification);
 
     connect(m_startupCdpClient, &CdpClient::chromeStarted, this, [this](qint64 processId) {
         setBusy(true);
@@ -218,8 +241,12 @@ void MainWindow::startTrainRefreshMacro()
     }
 
     m_trainRefreshMacroRunning = true;
+    m_noScreenChangeNotificationSent = false;
     for (const TrainInfoTab &tab : m_trainInfoTabs) {
         tab.controller->start();
+    }
+    if (!m_trainInfoTabs.isEmpty()) {
+        armNoScreenChangeNotification();
     }
     updateTrainRefreshMacroUi();
 
@@ -232,6 +259,8 @@ void MainWindow::stopTrainRefreshMacro(const QString &message)
 {
     const bool wasRunning = m_trainRefreshMacroRunning;
     m_trainRefreshMacroRunning = false;
+    m_noScreenChangeTimer->stop();
+    m_noScreenChangeNotificationSent = false;
     for (const TrainInfoTab &tab : m_trainInfoTabs) {
         tab.controller->stop();
     }
@@ -249,6 +278,12 @@ void MainWindow::onDomSnapshotCaptured(const QJsonObject &snapshot, const QStrin
         if (sessionId.isEmpty()) {
             return;
         }
+        const QByteArray fingerprint = QCryptographicHash::hash(
+            QJsonDocument(snapshot).toJson(QJsonDocument::Compact), QCryptographicHash::Sha256);
+        const auto existingFingerprint = m_trainInfoSnapshotFingerprints.constFind(sessionId);
+        const bool screenChanged = existingFingerprint != m_trainInfoSnapshotFingerprints.cend()
+            && existingFingerprint.value() != fingerprint;
+        m_trainInfoSnapshotFingerprints.insert(sessionId, fingerprint);
         if (!m_trainInfoTabs.contains(sessionId)) {
             const QString label = tr("탭 %1").arg(m_nextTrainInfoTabNumber++);
             TrainInfoTab tab;
@@ -266,6 +301,10 @@ void MainWindow::onDomSnapshotCaptured(const QJsonObject &snapshot, const QStrin
         tab.trains = trains;
         tab.controller->setTrainInfoContext(sessionId, selectedTrains(sessionId));
         if (m_trainRefreshMacroRunning) {
+            if (screenChanged || (!m_noScreenChangeTimer->isActive()
+                                  && !m_noScreenChangeNotificationSent)) {
+                armNoScreenChangeNotification();
+            }
             tab.controller->start();
         }
         updateTrainInfoTable();
@@ -323,6 +362,7 @@ void MainWindow::clearTrainInfoTable()
         delete tab.table;
     }
     m_trainInfoTabs.clear();
+    m_trainInfoSnapshotFingerprints.clear();
     m_selectedTrainKeys.clear();
     m_nextTrainInfoTabNumber = 1;
     ui->trainInfoTabWidget->clear();
@@ -344,6 +384,7 @@ void MainWindow::removeTrainInfoTab(const QString &sessionId)
     }
     delete iterator->table;
     m_trainInfoTabs.erase(iterator);
+    m_trainInfoSnapshotFingerprints.remove(sessionId);
     for (auto selected = m_selectedTrainKeys.begin(); selected != m_selectedTrainKeys.end();) {
         if (selected->startsWith(sessionId + QChar(0x1e))) {
             selected = m_selectedTrainKeys.erase(selected);
@@ -462,6 +503,51 @@ void MainWindow::sendBookingNotification(const QString &tab)
         } else {
             showStatus(tr("%1: ntfy 예매 완료 알림을 전송했습니다 (HTTP %2).")
                            .arg(tab)
+                           .arg(statusCode));
+        }
+        reply->deleteLater();
+    });
+}
+
+void MainWindow::armNoScreenChangeNotification()
+{
+    if (!m_trainRefreshMacroRunning || m_trainInfoTabs.isEmpty()) {
+        return;
+    }
+    m_noScreenChangeNotificationSent = false;
+    m_noScreenChangeTimer->start(ui->noScreenChangeTimeoutSpinBox->value() * 1000);
+}
+
+void MainWindow::sendNoScreenChangeNotification()
+{
+    if (!m_trainRefreshMacroRunning || m_trainInfoTabs.isEmpty()
+        || m_noScreenChangeNotificationSent) {
+        return;
+    }
+
+    m_noScreenChangeNotificationSent = true;
+    const int timeoutSeconds = ui->noScreenChangeTimeoutSpinBox->value();
+    QNetworkRequest request(QUrl(QStringLiteral("https://ntfy.sh/ktx")));
+    request.setHeader(QNetworkRequest::ContentTypeHeader,
+                      QStringLiteral("text/plain; charset=utf-8"));
+    request.setAttribute(QNetworkRequest::Http2AllowedAttribute, false);
+    request.setRawHeader("Title", QStringLiteral("KTX 매크로 화면 변화 없음").toUtf8());
+    request.setRawHeader("Priority", "high");
+
+    QNetworkReply *reply = m_notificationNetworkManager->post(
+        request,
+        tr("병렬 KTX 예매 매크로에서 %1초 동안 열차 조회 페이지의 화면 변화가 감지되지 않았습니다.")
+            .arg(timeoutSeconds)
+            .toUtf8());
+    connect(reply, &QNetworkReply::finished, this, [this, reply, timeoutSeconds]() {
+        const int statusCode = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        if (reply->error() != QNetworkReply::NoError || statusCode < 200 || statusCode >= 300) {
+            showStatus(tr("%1초 무변화 ntfy 알림을 전송하지 못했습니다: %2")
+                           .arg(timeoutSeconds)
+                           .arg(reply->errorString()), true);
+        } else {
+            showStatus(tr("%1초 동안 화면 변화가 없어 ntfy 알림을 전송했습니다 (HTTP %2).")
+                           .arg(timeoutSeconds)
                            .arg(statusCode));
         }
         reply->deleteLater();

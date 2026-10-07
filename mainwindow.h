@@ -2,6 +2,7 @@
 #define MAINWINDOW_H
 
 #include <QMainWindow>
+#include <QByteArray>
 #include <QHash>
 #include <QList>
 #include <QSet>
@@ -22,6 +23,7 @@ class QJsonObject;
 class QNetworkAccessManager;
 class QTableWidget;
 class QTableWidgetItem;
+class QTimer;
 class SnapshotStorage;
 
 class MainWindow : public QMainWindow
@@ -59,6 +61,8 @@ private:
                                                        const QString &label);
     void updateTrainRefreshMacroUi();
     void sendBookingNotification(const QString &tab);
+    void armNoScreenChangeNotification();
+    void sendNoScreenChangeNotification();
     void updatePageRecordingUi(bool active);
     void setBusy(bool busy);
     void showStatus(const QString &message, bool isError = false);
@@ -71,10 +75,13 @@ private:
     KorailAuthController *m_authController;
     PageRecorder *m_pageRecorder;
     QNetworkAccessManager *m_notificationNetworkManager;
+    QTimer *m_noScreenChangeTimer;
     QHash<QString, TrainInfoTab> m_trainInfoTabs;
+    QHash<QString, QByteArray> m_trainInfoSnapshotFingerprints;
     QSet<QString> m_selectedTrainKeys;
     int m_nextTrainInfoTabNumber = 1;
     bool m_trainRefreshMacroRunning = false;
+    bool m_noScreenChangeNotificationSent = false;
     bool m_updatingTrainInfoTable = false;
 };
 
